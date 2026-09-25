@@ -41,6 +41,47 @@
  *   `/gondolin` reports the booted image, where the selection came from, and the
  *   asset directory it resolved to.
  *
+ * Workspace visibility: the same gondolin.json files also control what the guest
+ * can see through the /workspace mount.
+ *
+ *     {
+ *       "image": "my:latest",
+ *       "hideNodeModules": true,
+ *       "hideGit": false,
+ *       "hidePaths": [".env", ".env.*", ".npmrc"]
+ *     }
+ *
+ *   `hideNodeModules` (default true) makes host `node_modules` invisible at every
+ *   depth and redirects the guest's own install to a shadow layer, so a Linux
+ *   guest never tries to exec host-built binaries and `npm install` starts from
+ *   scratch. That layer is gondolin's `MemoryProvider`, which lives in the host pi
+ *   process: VFS providers are host-side JavaScript objects served to the guest
+ *   over FUSE, not guest RAM, and the layer is dropped when the session closes.
+ *
+ *   Two consequences of hiding `node_modules` are worth knowing before you turn it
+ *   off to get them back. The guest cannot read dependency sources at all, so
+ *   "what does this package's type actually say" needs a guest-side install. And
+ *   the host `.npmrc` is in the default hide list, so repo npm policy such as
+ *   `save-exact` does not apply to installs made inside the VM.
+ *
+ *   `hideGit` (default false) shadows host `.git` the same way. It is opt-in
+ *   because the guest then sees no repository: `git status` and `git diff` through
+ *   delegated bash stop working, and anything the guest commits lives in the shadow
+ *   layer and is lost. Turn it on for read-only or mirror-style use of a tree.
+ *
+ *   `hidePaths` replaces the built-in secret list when present; an empty array
+ *   hides nothing. Patterns are VFS paths rooted at the mount, so the repo root is
+ *   `/`, and a pattern containing `/` is rooted there for you. Hidden files report
+ *   ENOENT for reads and writes alike. All keys merge per key, project scope over
+ *   user scope.
+ *
+ *   Gondolin also exposes this tree under its own FUSE mount point, so the guest
+ *   can reach it at /data/workspace as well as /workspace. That is the same
+ *   provider behind a bind mount, so this policy applies there too.
+ *
+ *   See "Workspace visibility policy" below for matching rules and what each
+ *   mode does to reads and writes.
+ *
  * Local patch — guest clock sync. See syncGuestClock() below. The guest clock is
  * frozen while the VM is paused between requests and nothing re-syncs it on
  * resume, which breaks TLS after enough idle time. The host is the time
@@ -50,7 +91,17 @@
 
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { listImageRefs, RealFSProvider, resolveImageSelector, VM, type VMOptions } from "@earendil-works/gondolin";
+import {
+	ERRNO,
+	listImageRefs,
+	RealFSProvider,
+	resolveImageSelector,
+	type ShadowPredicate,
+	ShadowProvider,
+	type VirtualProvider,
+	VM,
+	type VMOptions,
+} from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
@@ -77,6 +128,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const GUEST_WORKSPACE = "/workspace";
+/**
+ * Gondolin's default FUSE mount point. The VFS is mounted here once and individual
+ * mounts are bind-mounted into their configured locations, so the workspace tree is
+ * also reachable at `/data/workspace`. Same provider, same policy.
+ */
+const GUEST_FUSE_MOUNT = "/data";
 const DEFAULT_GREP_LIMIT = 100;
 
 /** How often to re-check the guest clock during a session. */
@@ -341,6 +398,301 @@ function tryResolveImageSelector(selector: string): ImageResolution {
 /** One-line description of what a selector resolves to locally. */
 function describeResolvedImage(selector: string): string {
 	return tryResolveImageSelector(selector).detail;
+}
+
+/**
+ * Config files for a project cwd. Project first: a repo can pin its own image
+ * over a personal default.
+ *
+ * The project path comes from the caller's cwd, not from the mount root. The
+ * mount and every path mapping in `toGuestPath` are pinned to `localCwd`,
+ * captured at extension load, because a guest mount must not move underneath a
+ * running session. Config resolution is a different question and follows the
+ * session's project instead.
+ */
+function imageConfigPaths(projectCwd: string): { project: string; user: string } {
+	return {
+		project: path.join(projectCwd, CONFIG_DIR_NAME, "gondolin.json"),
+		user: path.join(getAgentDir(), "gondolin.json"),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Workspace visibility policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Files hidden from the guest when `hidePaths` is not set.
+ *
+ * Bare names match a single path segment at any depth, so `.env` covers
+ * `packages/ai/.env` in a monorepo and not just the repo root.
+ */
+const DEFAULT_HIDE_PATHS = [
+	".env",
+	".env.*",
+	".npmrc",
+	".netrc",
+	".git-credentials",
+	"id_rsa",
+	"id_ed25519",
+	"*.pem",
+	"*.key",
+	"*.p12",
+	"*.pfx",
+];
+
+/**
+ * Exempt from the dotenv wildcard.
+ *
+ * `.env.*` catches `.env.example`, which is the one member of the family that is
+ * committed on purpose so a reader can see what the shape is. Hiding it breaks
+ * exactly the task it exists for. An explicit `hidePaths` entry naming the file
+ * still wins, so a project that treats its template as sensitive can hide it.
+ */
+const NEVER_HIDDEN_NAMES = [".env.example", ".env.sample", ".env.template", ".env.tpl"];
+
+/** Directory shadowed at every depth when `hideNodeModules` is set. */
+const NODE_MODULES_SEGMENT = "node_modules";
+
+/** Repository metadata shadowed at every depth when `hideGit` is set. */
+const GIT_SEGMENT = ".git";
+
+/**
+ * What the guest may see through the workspace mount.
+ *
+ * Paths are VFS paths: absolute and rooted at the mount, so the repo root is `/`
+ * here, not `/workspace`.
+ */
+type WorkspacePolicy = {
+	/** Hide host `node_modules` anywhere; guest writes go to the shadow layer instead. */
+	hideNodeModules: boolean;
+	/** Hide host `.git` anywhere; guest repo metadata lives in the shadow layer. */
+	hideGit: boolean;
+	/** Posix glob patterns hidden with reads and writes both reported as absent. */
+	hidePaths: string[];
+};
+
+/** A resolved policy plus the scope each key came from. */
+type WorkspacePolicyState = {
+	policy: WorkspacePolicy;
+	sources: { hidePaths: string; hideNodeModules: string; hideGit: string };
+};
+
+/**
+ * Match a VFS path against one hide pattern, including through ancestors.
+ *
+ * A pattern without "/" is tested against *every* segment, not just the leaf.
+ * Testing only the leaf leaks: hiding `.ssh` would drop it from `ls` while
+ * `cat /.ssh/id_rsa` still read the host file, because the predicate was only
+ * ever shown `id_rsa` and never the `.ssh` directory above it.
+ *
+ * A pattern with "/" is tested against each ancestor prefix, so `/secrets` also
+ * hides `/secrets/tokens/api`. Those comparisons are against absolute prefixes,
+ * which is why `createHidePredicate` normalizes patterns first — see
+ * `normalizeHidePattern`.
+ */
+function matchesHidePattern(vfsPath: string, pattern: string): boolean {
+	const segments = vfsPath.split("/").filter(Boolean);
+	for (let depth = 1; depth <= segments.length; depth++) {
+		if (!pattern.includes("/")) {
+			if (path.posix.matchesGlob(segments[depth - 1] ?? "", pattern)) return true;
+			continue;
+		}
+		const prefix = `/${segments.slice(0, depth).join("/")}`;
+		if (prefix === pattern || prefix.startsWith(`${pattern}/`) || path.posix.matchesGlob(prefix, pattern)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Root a hide pattern at the mount, the way gondolin roots shadow paths.
+ *
+ * Gondolin reads shadow paths as absolute VFS paths and normalizes `.env` to
+ * `/.env`. `matchesHidePattern` compares slash patterns against absolute
+ * prefixes, so an unnormalized `config/secrets.json` matches nothing at any
+ * depth and the secret stays readable with no warning. Normalizing first makes
+ * both spellings mean the same thing.
+ *
+ * Bare patterns stay bare on purpose: they match per segment at any depth, which
+ * is the reason this predicate exists instead of gondolin's
+ * `createShadowPathPredicate` — that one is exact-path only, so `[".env"]` hides
+ * the repo-root file but not `packages/ai/.env`.
+ *
+ * `~` has no meaning inside the mount because the host home directory is not
+ * mounted, so `~/.ssh` normalizes to `/~/.ssh` and matches nothing real.
+ * `loadWorkspacePolicy` warns about those instead of letting them fail silently.
+ */
+function normalizeHidePattern(pattern: string): string {
+	return pattern.includes("/") && !pattern.startsWith("/") ? `/${pattern}` : pattern;
+}
+
+/**
+ * Shadow policy for secret-shaped files.
+ *
+ * Reads report ENOENT and writes report ENOENT too: `createWorkspaceProvider`
+ * sets `denyWriteErrno` to ENOENT rather than the EACCES default, so a hidden
+ * file is indistinguishable from an absent one whether the guest lists it, stats
+ * it, or tries to create it. With the default, `touch .env` answers "permission
+ * denied" where an absent file would have succeeded, which is a working probe for
+ * what this list contains.
+ *
+ * The cost is that a legitimate write into a shadowed path reports "no such file
+ * or directory" instead of a permission error.
+ */
+function createHidePredicate(patterns: string[]): ShadowPredicate {
+	const normalized = patterns.map(normalizeHidePattern);
+	return ({ path: vfsPath }) => {
+		const name = path.posix.basename(vfsPath);
+		// An entry naming this file explicitly outranks the template exemption.
+		if (normalized.some((pattern) => pattern === name || pattern === vfsPath)) return true;
+		if (NEVER_HIDDEN_NAMES.includes(name)) return false;
+		return normalized.some((pattern) => matchesHidePattern(vfsPath, pattern));
+	};
+}
+
+/** True when any path segment equals `segment`, at the root or in a subpackage. */
+function hasSegment(vfsPath: string, segment: string): boolean {
+	return vfsPath.split("/").filter(Boolean).includes(segment);
+}
+
+/**
+ * Build the provider behind the `/workspace` mount.
+ *
+ * Layered per the gondolin VFS docs
+ * (https://earendil-works.github.io/gondolin/vfs/): "put the most
+ * security-sensitive policy closest to the real host filesystem provider". The
+ * deny layer therefore sits directly on `RealFSProvider`, so the gate on real
+ * host bytes is on the same path as those bytes, and any layer above it can only
+ * change the guest's view rather than reach the host.
+ *
+ * The order shows up in writes, not reads. A path matching both layers — a
+ * package's committed `node_modules/.env` — is redirected to the shadow layer by
+ * the outer tmpfs layer instead of being refused. It still never reaches the host,
+ * and the host copy stays unreadable.
+ *
+ * `denySymlinkBypass` stays at its default and does the work: the layer also runs
+ * the policy against `realpath()`, so `ln -s .env link && cat link` inside the
+ * repo resolves to `/.env` and is refused. `RealFSProvider` only blocks symlinks
+ * that *escape* the exposed directory, so without this layer the same internal
+ * link reads the secret straight through — that default is load-bearing here, not
+ * belt-and-braces.
+ */
+function createWorkspaceProvider(hostDir: string, policy: WorkspacePolicy): VirtualProvider {
+	let provider: VirtualProvider = new RealFSProvider(hostDir);
+	if (policy.hidePaths.length > 0) {
+		provider = new ShadowProvider(provider, {
+			shouldShadow: createHidePredicate(policy.hidePaths),
+			writeMode: "deny",
+			// Hidden means absent for writes as well as reads; see createHidePredicate.
+			denyWriteErrno: ERRNO.ENOENT,
+		});
+	}
+	if (policy.hideNodeModules) {
+		provider = new ShadowProvider(provider, {
+			shouldShadow: ({ path: vfsPath }) => hasSegment(vfsPath, NODE_MODULES_SEGMENT),
+			writeMode: "tmpfs",
+		});
+	}
+	if (policy.hideGit) {
+		provider = new ShadowProvider(provider, {
+			shouldShadow: ({ path: vfsPath }) => hasSegment(vfsPath, GIT_SEGMENT),
+			writeMode: "tmpfs",
+		});
+	}
+	return provider;
+}
+
+/** Parse a `hidePaths` value, dropping blanks and non-strings. */
+function parseHidePaths(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return value
+		.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+		.map((entry) => entry.trim());
+}
+
+/**
+ * Read the workspace policy from the gondolin.json files.
+ *
+ * Per-key merge with project scope winning, matching the `sandbox` and `preset`
+ * examples. `hidePaths` replaces the built-in list rather than adding to it: a
+ * single additive list would leave no way to make a file visible again short of
+ * editing the extension, and `"hidePaths": []` is that way out.
+ */
+function loadWorkspacePolicy(projectCwd: string): WorkspacePolicyState {
+	const { project, user } = imageConfigPaths(projectCwd);
+	const layers = [
+		{ scope: "user config", path: user, file: readImageConfigFile(user) },
+		{ scope: "project config", path: project, file: readImageConfigFile(project) },
+	];
+
+	let hidePaths = DEFAULT_HIDE_PATHS;
+	let hidePathsSource = "defaults";
+	let hideNodeModules = true;
+	let hideNodeModulesSource = "defaults";
+	let hideGit = false;
+	let hideGitSource = "defaults";
+
+	for (const layer of layers) {
+		if (layer.file.kind !== "object") continue;
+		const configuredPaths = layer.file.value.hidePaths;
+		if (configuredPaths !== undefined) {
+			const parsed = parseHidePaths(configuredPaths);
+			if (!parsed) {
+				console.warn(`[gondolin] ignoring non-array hidePaths in ${layer.path}`);
+			} else {
+				for (const entry of parsed) {
+					if (entry.startsWith("~")) {
+						console.warn(
+							`[gondolin] hidePaths entry "${entry}" in ${layer.path} can never match: the host ` +
+								"home directory is not mounted, so ~ has no meaning inside the workspace mount",
+						);
+					}
+				}
+				hidePaths = parsed;
+				hidePathsSource = layer.scope;
+			}
+		}
+		const configuredNodeModules = layer.file.value.hideNodeModules;
+		if (typeof configuredNodeModules === "boolean") {
+			hideNodeModules = configuredNodeModules;
+			hideNodeModulesSource = layer.scope;
+		}
+		const configuredGit = layer.file.value.hideGit;
+		if (typeof configuredGit === "boolean") {
+			hideGit = configuredGit;
+			hideGitSource = layer.scope;
+		}
+	}
+
+	return {
+		policy: { hideNodeModules, hideGit, hidePaths },
+		sources: {
+			hidePaths: hidePathsSource,
+			hideNodeModules: hideNodeModulesSource,
+			hideGit: hideGitSource,
+		},
+	};
+}
+
+/** Compact form used to diff the booted policy against the configured one. */
+function policySummary(policy: WorkspacePolicy): string {
+	return `hideNodeModules=${policy.hideNodeModules}, hideGit=${policy.hideGit}, hidePaths=${policy.hidePaths.join(",")}`;
+}
+
+/** How the node_modules layer is described in status output. */
+function nodeModulesLabel(policy: WorkspacePolicy): string {
+	return policy.hideNodeModules
+		? "host node_modules hidden; guest installs land in the host-side shadow layer"
+		: "host node_modules visible";
+}
+
+/** How the .git layer is described in status output. */
+function gitLabel(policy: WorkspacePolicy): string {
+	return policy.hideGit
+		? "host .git hidden; guest repo metadata stays in the host-side shadow layer"
+		: "host .git visible";
 }
 
 type TextToolResult<TDetails> = {
@@ -678,34 +1030,19 @@ export default function (pi: ExtensionAPI) {
 	let shellPath = "/bin/sh";
 	/** The selection the running VM booted with, so status can diff it against config. */
 	let bootedImage: ImageSelection | undefined;
-
-	/**
-	 * Config files for a project cwd. Project first: a repo can pin its own image
-	 * over a personal default.
-	 *
-	 * The project path comes from the caller's cwd, not from the mount root. The
-	 * mount and every path mapping in `toGuestPath` are pinned to `localCwd`,
-	 * captured at extension load, because a guest mount must not move underneath a
-	 * running session. Config resolution is a different question and follows the
-	 * session's project instead.
-	 */
-	function imageConfigPaths(projectCwd: string): { project: string; user: string } {
-		return {
-			project: path.join(projectCwd, CONFIG_DIR_NAME, "gondolin.json"),
-			user: path.join(getAgentDir(), "gondolin.json"),
-		};
-	}
+	/** The visibility policy the running VM mounted with, for the same reason. */
+	let bootedPolicy: WorkspacePolicyState | undefined;
 
 	/**
 	 * Resolve the guest image selector for a VM start. First hit wins:
 	 * `--gondolin-image` > `GONDOLIN_IMAGE` > project config > user config.
 	 * Undefined means "let gondolin use its own default".
 	 *
-	 * First-wins-per-file is deliberate while this config is single-key: a project
-	 * pin is meant to replace the user pin outright, not blend with it. If a second
-	 * key is ever added to gondolin.json, switch to a merge (as the `sandbox` and
-	 * `preset` examples do) or a project pin will silently discard the user's
-	 * other settings.
+	 * The image is read as a whole-value pin rather than merged: a project pin is
+	 * meant to replace the user pin outright, not blend with it. The workspace
+	 * policy keys in the same files are merged per key by `loadWorkspacePolicy`, so
+	 * a project that sets only `hideNodeModules` still inherits the user's
+	 * `hidePaths`.
 	 */
 	function resolveImageSelection(projectCwd: string): ImageSelection | undefined {
 		const flag = pi.getFlag("gondolin-image");
@@ -893,11 +1230,12 @@ export default function (pi: ExtensionAPI) {
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
 		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
 		const selection = resolveImageSelection(ctx?.cwd ?? localCwd);
+		const policy = loadWorkspacePolicy(ctx?.cwd ?? localCwd);
 		const vmOptions: VMOptions = {
 			sessionLabel: `pi ${path.basename(localCwd)}`,
 			vfs: {
 				mounts: {
-					[GUEST_WORKSPACE]: new RealFSProvider(localCwd),
+					[GUEST_WORKSPACE]: createWorkspaceProvider(localCwd, policy.policy),
 				},
 			},
 		};
@@ -907,8 +1245,10 @@ export default function (pi: ExtensionAPI) {
 		const created = await VM.create(vmOptions);
 		// Only once the boot succeeded. Assigning this earlier leaves `/gondolin`
 		// reporting an image that never booted if VM.create throws, or while a
-		// registry pull is still in flight.
+		// registry pull is still in flight. Same for the policy: the provider stack
+		// is fixed at mount time, so what is live is what this VM was built with.
 		bootedImage = selection;
+		bootedPolicy = policy;
 		// Before anything that could open a socket: a stale guest clock turns every
 		// freshly minted cert into CERT_NOT_YET_VALID.
 		const clock = await syncGuestClock(created);
@@ -929,7 +1269,10 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.theme.fg("accent", `Gondolin: ${created.id.slice(0, 8)} (${GUEST_WORKSPACE})`),
 		);
 		const imageNote = selection ? `image ${selection.selector}` : "gondolin default image";
-		ctx?.ui.notify(`Gondolin VM ready (${imageNote}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
+		const readyNote = `Gondolin VM ready (${imageNote}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`;
+		const policyNotes = [nodeModulesLabel(policy.policy)];
+		if (policy.policy.hideGit) policyNotes.push(gitLabel(policy.policy));
+		ctx?.ui.notify(`${readyNote} ${policyNotes.join(". ")}.`, "info");
 		return created;
 	}
 
@@ -981,21 +1324,32 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Show the booted image and the current config separately: they differ
 			// whenever the pin changed after this VM started, and "which image am I in"
-			// is otherwise unanswerable.
+			// is otherwise unanswerable. The policy has the same split — the provider
+			// stack is built at mount time, so editing gondolin.json mid-session
+			// changes nothing until the next VM.
 			const current = resolveImageSelection(ctx.cwd);
+			const configuredPolicy = loadWorkspacePolicy(ctx.cwd);
+			const active = bootedPolicy ?? configuredPolicy;
 			const lines = [
 				`Gondolin VM: ${activeVm.id}`,
 				`Host workspace: ${localCwd}`,
 				`Guest workspace: ${GUEST_WORKSPACE}`,
+				`Guest alt path: ${GUEST_FUSE_MOUNT}${GUEST_WORKSPACE} (same provider, same policy)`,
 				`Shell: ${shellPath}`,
 				`Image (booted): ${
 					bootedImage ? `${bootedImage.selector} from ${bootedImage.source}` : "gondolin default"
 				}`,
 				bootedImage ? describeResolvedImage(bootedImage.selector) : undefined,
 				`Guest clock: ${driftLabel}`,
+				`Node modules: ${nodeModulesLabel(active.policy)} (${active.sources.hideNodeModules})`,
+				`Git metadata: ${gitLabel(active.policy)} (${active.sources.hideGit})`,
+				`Hidden paths: ${active.policy.hidePaths.join(", ") || "none"} (${active.sources.hidePaths})`,
 			];
 			if (current && current.selector !== bootedImage?.selector) {
 				lines.push(`Image (configured): ${current.selector} from ${current.source} — applies to the next VM`);
+			}
+			if (policySummary(configuredPolicy.policy) !== policySummary(active.policy)) {
+				lines.push(`Policy (configured): ${policySummary(configuredPolicy.policy)} — applies to the next VM`);
 			}
 			ctx.ui.notify(lines.filter((line): line is string => line !== undefined).join("\n"), "info");
 		},
