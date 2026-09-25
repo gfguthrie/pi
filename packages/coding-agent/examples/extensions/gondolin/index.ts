@@ -23,9 +23,17 @@
  *   the first of these that is set wins:
  *
  *     1. pi --gondolin-image <selector>
- *     2. GONDOLIN_IMAGE=<selector>
- *     3. <cwd>/.pi/gondolin.json      { "image": "<selector>" }
- *     4. <agent-dir>/gondolin.json    { "image": "<selector>" }
+ *     2. <cwd>/.pi/gondolin.json      { "image": "<selector>" }
+ *     3. <agent-dir>/gondolin.json    { "image": "<selector>" }
+ *     4. gondolin's own default: GONDOLIN_DEFAULT_IMAGE (default "alpine-base:latest")
+ *
+ *   `GONDOLIN_IMAGE` is retired. The extension invented that name — gondolin
+ *   never read it — and placing it above the config files meant a leftover shell
+ *   variable outranked the repo. `GONDOLIN_DEFAULT_IMAGE` is gondolin's own knob
+ *   and sits below the config files, which is where a machine-wide default
+ *   belongs. Setting `GONDOLIN_IMAGE` now warns at startup and changes nothing.
+ *   `GONDOLIN_GUEST_DIR` outranks rung 4 — gondolin resolves it before the
+ *   default selector — and `/gondolin` names whichever of the two applies.
  *
  *   A selector is a gondolin image ref (`name:tag`), a build id, or a directory
  *   of built guest assets. Prefer a ref: `gondolin image import <dir> --tag
@@ -93,6 +101,45 @@
  *   mode does to reads and writes, and WORKSPACE_VISIBILITY.md next to this file
  *   for the inventory of non-portable build directories across ecosystems and the
  *   proposed config shape if these keys keep growing.
+ *
+ * Guest resources: RAM and CPU count come from the same gondolin.json files, plus
+ * CLI flags. Each key resolves on its own; first hit wins:
+ *
+ *     1. pi --gondolin-memory <size> / pi --gondolin-cpus <n>
+ *     2. <cwd>/.pi/gondolin.json      { "memory": "4G", "cpus": 4 }
+ *     3. <agent-dir>/gondolin.json    { "memory": "2G" }
+ *     4. gondolin's defaults (memory "1G", cpus 2)
+ *
+ *   So a project that pins only `cpus` still inherits the user's `memory`.
+ *
+ *   `memory` must be digits plus a K/M/G/T suffix (`512M`, `4G`), at least 1M.
+ *   Gondolin hands the string to QEMU `-m` verbatim and the krun backend parses
+ *   it separately, where a bare number means MiB while QEMU reads a bare number
+ *   as bytes — requiring the suffix keeps both backends meaning the same thing.
+ *   The floor is gondolin's own: it validates nothing in between, and krun rounds
+ *   small values up with `Math.max(1, ceil(bytes / MiB))`, so `"0G"` or `"512K"`
+ *   is a 1 MiB guest on krun and a bad `-m` argument on the qemu backend.
+ *
+ *   `cpus` must be an integer from 1 to 255, the cap both QEMU `-smp` and the
+ *   krun backend enforce. Decimal digits only: `"0x10"` is rejected rather than
+ *   silently read as 16.
+ *
+ *   Bad values are dropped with an error notification rather than passed through,
+ *   and a bad value stops the ladder for that key. The highest layer that sets a
+ *   key decides, so a typo in the project file yields gondolin's default rather
+ *   than the user's value. Falling through is what made `--gondolin-memory 8GB`
+ *   unreadable: the flag looked ignored while a file the caller was not looking at
+ *   quietly supplied the size. See `firstConfigured`.
+ *
+ *   Swap is not configurable. Gondolin 0.12.0 has no swap option and never
+ *   creates a swap device, so the guest runs with 0 swap (`/proc/swaps` is empty)
+ *   and an OOM is a hard kill rather than a slowdown. Adding swap needs an
+ *   upstream gondolin feature — a second disk plus `mkswap`/`swapon` at boot — not
+ *   an extension change.
+ *
+ *   Both values are fixed at boot. Editing the config mid-session affects only the
+ *   next VM, the same way the image pin and visibility policy do; `/gondolin`
+ *   shows the booted values and the configured ones when they differ.
  *
  * Local patch — guest clock sync. See syncGuestClock() below. The guest clock is
  * frozen while the VM is paused between requests and nothing re-syncs it on
@@ -304,13 +351,15 @@ function readImageConfigFile(configPath: string): ImageConfigFile {
 	return { kind: "object", value: parsed as Record<string, unknown> };
 }
 
+/** A usable `image` value: a non-blank selector string. */
+function parseSelectorValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
 /** Read the pinned `image` selector from a Gondolin config file. */
 function readImageConfigSelector(configPath: string): string | undefined {
 	const file = readImageConfigFile(configPath);
-	if (file.kind !== "object") return undefined;
-	const image = file.value.image;
-	if (typeof image !== "string" || image.trim() === "") return undefined;
-	return image.trim();
+	return file.kind === "object" ? parseSelectorValue(file.value.image) : undefined;
 }
 
 function writeImageConfigObject(configPath: string, value: Record<string, unknown>): void {
@@ -410,6 +459,23 @@ function tryResolveImageSelector(selector: string): ImageResolution {
 /** One-line description of what a selector resolves to locally. */
 function describeResolvedImage(selector: string): string {
 	return tryResolveImageSelector(selector).detail;
+}
+
+/**
+ * Name whatever gondolin boots when nothing pins an image.
+ *
+ * `ensureGuestAssets()` resolves `GONDOLIN_GUEST_DIR` before the default image
+ * selector, so a guest-directory override outranks `GONDOLIN_DEFAULT_IMAGE` and
+ * has to be reported as that rather than as a ref nobody set. Without this the
+ * only env layer left in the ladder is invisible behind the words "gondolin
+ * default".
+ */
+function gondolinDefaultImageLabel(): string {
+	const guestDir = process.env.GONDOLIN_GUEST_DIR?.trim();
+	if (guestDir) return `gondolin default (GONDOLIN_GUEST_DIR=${guestDir})`;
+	const defaultImage = process.env.GONDOLIN_DEFAULT_IMAGE?.trim();
+	if (defaultImage) return `gondolin default (GONDOLIN_DEFAULT_IMAGE=${defaultImage})`;
+	return "gondolin default (alpine-base:latest)";
 }
 
 /**
@@ -625,6 +691,18 @@ function parseHidePaths(value: unknown): string[] | undefined {
 }
 
 /**
+ * The gondolin.json files in merge order: user first, then project, so a later
+ * layer overwrites keys set by an earlier one.
+ */
+function configLayers(projectCwd: string): Array<{ scope: string; path: string; file: ImageConfigFile }> {
+	const { project, user } = imageConfigPaths(projectCwd);
+	return [
+		{ scope: "user config", path: user, file: readImageConfigFile(user) },
+		{ scope: "project config", path: project, file: readImageConfigFile(project) },
+	];
+}
+
+/**
  * Read the workspace policy from the gondolin.json files.
  *
  * Per-key merge with project scope winning, matching the `sandbox` and `preset`
@@ -633,11 +711,7 @@ function parseHidePaths(value: unknown): string[] | undefined {
  * editing the extension, and `"hidePaths": []` is that way out.
  */
 function loadWorkspacePolicy(projectCwd: string): WorkspacePolicyState {
-	const { project, user } = imageConfigPaths(projectCwd);
-	const layers = [
-		{ scope: "user config", path: user, file: readImageConfigFile(user) },
-		{ scope: "project config", path: project, file: readImageConfigFile(project) },
-	];
+	const layers = configLayers(projectCwd);
 
 	let hidePaths = DEFAULT_HIDE_PATHS;
 	let hidePathsSource = "defaults";
@@ -705,6 +779,164 @@ function gitLabel(policy: WorkspacePolicy): string {
 	return policy.hideGit
 		? "host .git hidden; guest repo metadata stays in the host-side shadow layer"
 		: "host .git visible";
+}
+
+// ---------------------------------------------------------------------------
+// Layered config resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * One candidate value for a single config key, tagged with the layer to blame.
+ *
+ * The tag is the point: resolution order is silent, and "which layer set this"
+ * is the only way to answer why a value won.
+ */
+type ConfigCandidate = { source: string; value: unknown };
+
+/**
+ * Take the first candidate that is set, and stop there even when it is invalid.
+ *
+ * "First hit wins" has to mean first *hit*, not first *good* hit. The layer that
+ * sets a key is the layer the caller believes is in charge, so a bad value there
+ * is reported and the key falls back to the backend default rather than to a
+ * lower layer nobody is looking at. Falling through is what made
+ * `--gondolin-memory 8GB` unreadable: the flag looked ignored while a project
+ * file quietly supplied the size.
+ */
+function firstConfigured<T>(
+	candidates: ConfigCandidate[],
+	parse: (value: unknown, source: string) => T | undefined,
+): { value: T; source: string } | undefined {
+	for (const candidate of candidates) {
+		if (candidate.value === undefined) continue;
+		const value = parse(candidate.value, candidate.source);
+		return value === undefined ? undefined : { value, source: candidate.source };
+	}
+	return undefined;
+}
+
+/**
+ * Candidates for one key from the gondolin.json layers, highest precedence first.
+ *
+ * `configLayers` returns merge order (user then project); first-hit resolution
+ * wants the reverse, so the list is flipped here rather than reshaping the merge
+ * helper around one caller. Layers that are missing or unparseable contribute no
+ * candidate, which keeps them meaning "unset" rather than "invalid".
+ */
+function configuredCandidates(layers: ReturnType<typeof configLayers>, key: string): ConfigCandidate[] {
+	const candidates: ConfigCandidate[] = [];
+	for (const layer of [...layers].reverse()) {
+		if (layer.file.kind !== "object") continue;
+		const value = layer.file.value[key];
+		// Unset and blank both mean "this layer does not set the key", so neither one
+		// stops the ladder for the layers below it.
+		if (value === undefined || (typeof value === "string" && value.trim() === "")) continue;
+		candidates.push({ source: layer.scope, value });
+	}
+	return candidates;
+}
+
+// ---------------------------------------------------------------------------
+// Guest resources
+// ---------------------------------------------------------------------------
+
+/**
+ * Accepted `memory` spellings: digits plus a K/M/G/T suffix.
+ *
+ * Gondolin forwards this string to QEMU `-m` unchanged, and the krun backend
+ * parses it with its own `^(\d+)([kKmMgGtT]?)$` regex where a bare number means
+ * MiB — while QEMU reads a bare number as bytes. Requiring the suffix removes
+ * that ambiguity instead of leaving a 1048576x difference to surface as a boot
+ * failure on one backend and a useless VM on the other.
+ */
+const MEMORY_PATTERN = /^(\d+)([KkMmGgTt])$/;
+
+const MEMORY_UNIT_BYTES: Record<string, number> = {
+	K: 1024,
+	M: 1024 * 1024,
+	G: 1024 * 1024 * 1024,
+	T: 1024 * 1024 * 1024 * 1024,
+};
+
+/**
+ * Smallest guest gondolin can actually be given.
+ *
+ * Gondolin validates nothing between this value and the backend: `memory` goes
+ * straight to `-m`, and the krun parser clamps with `Math.max(1, ceil(bytes /
+ * MiB))`. Below 1 MiB that means a 1 MiB guest on krun and a rejected `-m`
+ * argument on qemu, so the floor is taken from krun's own rounding boundary.
+ */
+const MIN_MEMORY_BYTES = 1024 * 1024;
+
+/** QEMU `-smp` and the krun backend both cap the guest at 255 vCPUs. */
+const MAX_CPUS = 255;
+
+/** Digits only. `Number()` would read "0x10" as 16 and "1e2" as 100. */
+const CPU_COUNT_PATTERN = /^\d+$/;
+
+/** Gondolin's own defaults, used in status output when nothing is configured. */
+const GONDOLIN_DEFAULT_MEMORY = "1G";
+const GONDOLIN_DEFAULT_CPUS = 2;
+
+/** Guest VM sizing. An absent key means "use gondolin's default". */
+type ResourceConfig = {
+	memory?: string;
+	cpus?: number;
+};
+
+/** Resolved sizing, the scope each key came from, and what had to be dropped. */
+type ResourceState = {
+	resources: ResourceConfig;
+	sources: { memory?: string; cpus?: string };
+	/** Invalid values that were dropped, as human-readable sentences. */
+	problems: string[];
+};
+
+/** Validate a `memory` value; a bad one is dropped and recorded in `problems`. */
+function parseMemoryValue(value: unknown, source: string, problems: string[]): string | undefined {
+	if (value === undefined) return undefined;
+	const trimmed = typeof value === "string" ? value.trim() : "";
+	const match = MEMORY_PATTERN.exec(trimmed);
+	if (!match) {
+		problems.push(
+			`ignoring memory from ${source}: expected a size like "2G" or "512M", got ${JSON.stringify(value)}`,
+		);
+		return undefined;
+	}
+	const bytes = Number(match[1]) * (MEMORY_UNIT_BYTES[match[2].toUpperCase()] ?? Number.NaN);
+	if (!Number.isFinite(bytes) || bytes < MIN_MEMORY_BYTES) {
+		problems.push(`ignoring memory from ${source}: "${trimmed}" is below the 1M minimum a guest can boot with`);
+		return undefined;
+	}
+	return trimmed;
+}
+
+/** Validate a `cpus` value, accepting a JSON number or a decimal-digit string. */
+function parseCpusValue(value: unknown, source: string, problems: string[]): number | undefined {
+	if (value === undefined) return undefined;
+	const numeric = typeof value === "string" && CPU_COUNT_PATTERN.test(value.trim()) ? Number(value.trim()) : value;
+	if (typeof numeric !== "number" || !Number.isInteger(numeric) || numeric < 1 || numeric > MAX_CPUS) {
+		problems.push(
+			`ignoring cpus from ${source}: expected an integer between 1 and ${MAX_CPUS}, got ${JSON.stringify(value)}`,
+		);
+		return undefined;
+	}
+	return numeric;
+}
+
+/** Compact form used to diff the booted sizing against the configured sizing. */
+function resourceSummary(resources: ResourceConfig): string {
+	return `memory=${resources.memory ?? GONDOLIN_DEFAULT_MEMORY}, cpus=${resources.cpus ?? GONDOLIN_DEFAULT_CPUS}`;
+}
+
+/** Status wording for a sizing value that may be falling back to gondolin's default. */
+function resourceValueLabel(
+	value: string | number | undefined,
+	fallback: string | number,
+	source: string | undefined,
+): string {
+	if (value === undefined) return `${fallback} (gondolin default, ${source ?? "defaults"})`;
+	return `${value} (${source ?? "defaults"})`;
 }
 
 type TextToolResult<TDetails> = {
@@ -1110,6 +1342,20 @@ export default function (pi: ExtensionAPI) {
 		description: "Gondolin guest image selector: name:tag ref, build id, or built asset directory",
 		type: "string",
 	});
+	pi.registerFlag("gondolin-memory", {
+		description: "Guest VM memory size, digits plus K/M/G/T suffix (e.g. 2G). Overrides gondolin.json",
+		type: "string",
+	});
+	pi.registerFlag("gondolin-cpus", {
+		description: `Guest VM cpu count, 1-${MAX_CPUS}. Overrides gondolin.json`,
+		type: "string",
+	});
+
+	/** A registered string flag, with a blank value treated as unset. */
+	function stringFlag(name: string): string | undefined {
+		const value = pi.getFlag(name);
+		return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+	}
 
 	let vm: VM | undefined;
 	let vmStarting: Promise<VM> | undefined;
@@ -1118,33 +1364,76 @@ export default function (pi: ExtensionAPI) {
 	let bootedImage: ImageSelection | undefined;
 	/** The visibility policy the running VM mounted with, for the same reason. */
 	let bootedPolicy: WorkspacePolicyState | undefined;
+	/** The sizing the running VM booted with, for the same reason. */
+	let bootedResources: ResourceState | undefined;
+
+	/**
+	 * Resolve guest memory and CPU count. Per key, first hit wins:
+	 * `--gondolin-memory` / `--gondolin-cpus` > project config > user config.
+	 * Unset keys stay unset so gondolin's own defaults apply.
+	 *
+	 * Keys resolve independently, so a project pinning only `cpus` still inherits
+	 * the user's `memory` — the same per-key merge `loadWorkspacePolicy` uses, and
+	 * unlike `resolveImageSelection`, which replaces the whole value.
+	 *
+	 * A bad value stops the ladder for its key (see `firstConfigured`) and the key
+	 * falls back to gondolin's default. Passing one through instead would put a bad
+	 * size straight on QEMU's command line, where the whole boot fails and reads as
+	 * "gondolin is broken" rather than "my config has a typo".
+	 */
+	function resolveResourceSelection(projectCwd: string): ResourceState {
+		const layers = configLayers(projectCwd);
+		const resources: ResourceConfig = {};
+		const sources: { memory?: string; cpus?: string } = {};
+		const problems: string[] = [];
+
+		const memory = firstConfigured(
+			[
+				{ source: "--gondolin-memory", value: stringFlag("gondolin-memory") },
+				...configuredCandidates(layers, "memory"),
+			],
+			(value, source) => parseMemoryValue(value, source, problems),
+		);
+		if (memory !== undefined) {
+			resources.memory = memory.value;
+			sources.memory = memory.source;
+		}
+
+		const cpus = firstConfigured(
+			[{ source: "--gondolin-cpus", value: stringFlag("gondolin-cpus") }, ...configuredCandidates(layers, "cpus")],
+			(value, source) => parseCpusValue(value, source, problems),
+		);
+		if (cpus !== undefined) {
+			resources.cpus = cpus.value;
+			sources.cpus = cpus.source;
+		}
+
+		return { resources, sources, problems };
+	}
 
 	/**
 	 * Resolve the guest image selector for a VM start. First hit wins:
-	 * `--gondolin-image` > `GONDOLIN_IMAGE` > project config > user config.
-	 * Undefined means "let gondolin use its own default".
+	 * `--gondolin-image` > project config > user config.
+	 *
+	 * Undefined means "let gondolin pick", which lands on `GONDOLIN_DEFAULT_IMAGE`
+	 * (default `alpine-base:latest`) unless `GONDOLIN_GUEST_DIR` points at an asset
+	 * directory. `gondolinDefaultImageLabel()` names whichever fallback applies so
+	 * status output does not hide it behind the words "gondolin default".
 	 *
 	 * The image is read as a whole-value pin rather than merged: a project pin is
 	 * meant to replace the user pin outright, not blend with it. The workspace
-	 * policy keys in the same files are merged per key by `loadWorkspacePolicy`, so
-	 * a project that sets only `hideNodeModules` still inherits the user's
-	 * `hidePaths`.
+	 * policy and resource keys in the same files are merged per key, so a project
+	 * that sets only `hideNodeModules` still inherits the user's `hidePaths`.
 	 */
 	function resolveImageSelection(projectCwd: string): ImageSelection | undefined {
-		const flag = pi.getFlag("gondolin-image");
-		if (typeof flag === "string" && flag.trim() !== "") {
-			return { selector: flag.trim(), source: "--gondolin-image" };
-		}
-		const envSelector = process.env.GONDOLIN_IMAGE;
-		if (envSelector && envSelector.trim() !== "") {
-			return { selector: envSelector.trim(), source: "GONDOLIN_IMAGE" };
-		}
-		const { project, user } = imageConfigPaths(projectCwd);
-		const projectSelector = readImageConfigSelector(project);
-		if (projectSelector) return { selector: projectSelector, source: project };
-		const userSelector = readImageConfigSelector(user);
-		if (userSelector) return { selector: userSelector, source: user };
-		return undefined;
+		const selection = firstConfigured(
+			[
+				{ source: "--gondolin-image", value: stringFlag("gondolin-image") },
+				...configuredCandidates(configLayers(projectCwd), "image"),
+			],
+			(value) => parseSelectorValue(value),
+		);
+		return selection === undefined ? undefined : { selector: selection.value, source: selection.source };
 	}
 
 	/** Locally imported image refs, for `/gondolin image` completions and usage text. */
@@ -1246,7 +1535,7 @@ export default function (pi: ExtensionAPI) {
 			const next = resolveImageSelection(ctx.cwd);
 			ctx.ui.notify(
 				`Cleared ${scope} image pin (${targetPath}). Next VM: ${
-					next ? `${next.selector} (${next.source})` : "gondolin default"
+					next ? `${next.selector} (${next.source})` : gondolinDefaultImageLabel()
 				}.`,
 				"info",
 			);
@@ -1276,7 +1565,7 @@ export default function (pi: ExtensionAPI) {
 			[
 				`Pinned image ${value} in ${targetPath}.`,
 				resolution.detail,
-				`Applies to the next VM; this one keeps ${bootedImage ? bootedImage.selector : "the gondolin default"}.`,
+				`Applies to the next VM; this one keeps ${bootedImage ? bootedImage.selector : gondolinDefaultImageLabel()}.`,
 			].join("\n"),
 			resolution.ok ? "info" : "warning",
 		);
@@ -1315,8 +1604,23 @@ export default function (pi: ExtensionAPI) {
 
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
 		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
+		// Retired rather than silently ignored: a pin in a shell profile that stops
+		// working would drop the session onto a different image with no explanation.
+		const retiredImageEnv = process.env.GONDOLIN_IMAGE?.trim();
+		if (retiredImageEnv) {
+			const message =
+				`GONDOLIN_IMAGE=${retiredImageEnv} is no longer read. Use GONDOLIN_DEFAULT_IMAGE for a ` +
+				"machine-wide default (it sits below the config files), or pin with /gondolin image.";
+			console.warn(`[gondolin] ${message}`);
+			ctx?.ui.notify(message, "warning");
+		}
 		const selection = resolveImageSelection(ctx?.cwd ?? localCwd);
 		const policy = loadWorkspacePolicy(ctx?.cwd ?? localCwd);
+		const resourceState = resolveResourceSelection(ctx?.cwd ?? localCwd);
+		for (const problem of resourceState.problems) {
+			console.warn(`[gondolin] ${problem}`);
+			ctx?.ui.notify(`Gondolin: ${problem}. That key falls back to gondolin's default.`, "error");
+		}
 		const vmOptions: VMOptions = {
 			sessionLabel: `pi ${path.basename(localCwd)}`,
 			vfs: {
@@ -1325,6 +1629,12 @@ export default function (pi: ExtensionAPI) {
 				},
 			},
 		};
+		// Set at the top level rather than as `sandbox.memory`: `VM` copies the
+		// top-level value into the sandbox only when the sandbox does not already set
+		// it, so this cannot fight an explicit sandbox option, and it keeps
+		// `vmOptions.sandbox` about the image alone.
+		if (resourceState.resources.memory !== undefined) vmOptions.memory = resourceState.resources.memory;
+		if (resourceState.resources.cpus !== undefined) vmOptions.cpus = resourceState.resources.cpus;
 		// A string selector resolves against the local image store first and only
 		// pulls from the builtin registry on a local miss.
 		if (selection) vmOptions.sandbox = { imagePath: selection.selector };
@@ -1335,6 +1645,7 @@ export default function (pi: ExtensionAPI) {
 		// is fixed at mount time, so what is live is what this VM was built with.
 		bootedImage = selection;
 		bootedPolicy = policy;
+		bootedResources = resourceState;
 		// Before anything that could open a socket: a stale guest clock turns every
 		// freshly minted cert into CERT_NOT_YET_VALID.
 		const clock = await syncGuestClock(created);
@@ -1354,8 +1665,8 @@ export default function (pi: ExtensionAPI) {
 			"gondolin",
 			ctx.ui.theme.fg("accent", `Gondolin: ${created.id.slice(0, 8)} (${GUEST_WORKSPACE})`),
 		);
-		const imageNote = selection ? `image ${selection.selector}` : "gondolin default image";
-		const readyNote = `Gondolin VM ready (${imageNote}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`;
+		const imageNote = selection ? `image ${selection.selector}` : gondolinDefaultImageLabel();
+		const readyNote = `Gondolin VM ready (${imageNote}, ${resourceSummary(resourceState.resources)}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`;
 		const policyNotes = [nodeModulesLabel(policy.policy)];
 		if (policy.policy.hideGit) policyNotes.push(gitLabel(policy.policy));
 		ctx?.ui.notify(`${readyNote} ${policyNotes.join(". ")}.`, "info");
@@ -1416,26 +1727,51 @@ export default function (pi: ExtensionAPI) {
 			const current = resolveImageSelection(ctx.cwd);
 			const configuredPolicy = loadWorkspacePolicy(ctx.cwd);
 			const active = bootedPolicy ?? configuredPolicy;
+			const configuredResources = resolveResourceSelection(ctx.cwd);
+			const activeResources = bootedResources ?? configuredResources;
+			// Every source below is named by scope ("user config", "project config"),
+			// so print the paths once here rather than repeating them on each line.
+			const configPaths = imageConfigPaths(ctx.cwd);
 			const lines = [
 				`Gondolin VM: ${activeVm.id}`,
 				`Host workspace: ${localCwd}`,
 				`Guest workspace: ${GUEST_WORKSPACE}`,
 				`Guest alt path: ${GUEST_FUSE_MOUNT}${GUEST_WORKSPACE} (same provider, same policy)`,
 				`Shell: ${shellPath}`,
+				`Config files: user ${configPaths.user}, project ${configPaths.project}`,
 				`Image (booted): ${
-					bootedImage ? `${bootedImage.selector} from ${bootedImage.source}` : "gondolin default"
+					bootedImage ? `${bootedImage.selector} from ${bootedImage.source}` : gondolinDefaultImageLabel()
 				}`,
 				bootedImage ? describeResolvedImage(bootedImage.selector) : undefined,
 				`Guest clock: ${driftLabel}`,
+				`Memory: ${resourceValueLabel(
+					activeResources.resources.memory,
+					GONDOLIN_DEFAULT_MEMORY,
+					activeResources.sources.memory,
+				)}`,
+				`CPUs: ${resourceValueLabel(
+					activeResources.resources.cpus,
+					GONDOLIN_DEFAULT_CPUS,
+					activeResources.sources.cpus,
+				)}`,
 				`Node modules: ${nodeModulesLabel(active.policy)} (${active.sources.hideNodeModules})`,
 				`Git metadata: ${gitLabel(active.policy)} (${active.sources.hideGit})`,
 				`Hidden paths: ${active.policy.hidePaths.join(", ") || "none"} (${active.sources.hidePaths})`,
+				"Swap: none (gondolin creates no swap device)",
 			];
 			if (current && current.selector !== bootedImage?.selector) {
 				lines.push(`Image (configured): ${current.selector} from ${current.source} — applies to the next VM`);
 			}
 			if (policySummary(configuredPolicy.policy) !== policySummary(active.policy)) {
 				lines.push(`Policy (configured): ${policySummary(configuredPolicy.policy)} — applies to the next VM`);
+			}
+			if (resourceSummary(configuredResources.resources) !== resourceSummary(activeResources.resources)) {
+				lines.push(
+					`Resources (configured): ${resourceSummary(configuredResources.resources)} — applies to the next VM`,
+				);
+			}
+			for (const problem of configuredResources.problems) {
+				lines.push(`Resource config: ${problem}`);
 			}
 			ctx.ui.notify(lines.filter((line): line is string => line !== undefined).join("\n"), "info");
 		},
