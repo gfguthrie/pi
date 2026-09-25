@@ -69,11 +69,21 @@
  *   delegated bash stop working, and anything the guest commits lives in the shadow
  *   layer and is lost. Turn it on for read-only or mirror-style use of a tree.
  *
+ *   Either way, guest git commands need one setting the host cannot leave to
+ *   config files: `RealFSProvider` passes host ownership through, so `/workspace`
+ *   reports the host uid/gid while guest processes run as root, and git rejects
+ *   every repo not owned by the effective uid. The extension registers the mount
+ *   paths as `safe.directory` entries in each command's environment; see
+ *   `gitSafeDirectoryEnv`. That covers the ownership check only. Commits still
+ *   need an identity, and the guest has none: the host `~/.gitconfig` is not
+ *   mounted, and the inherited `GIT_ASKPASS` names a host path.
+ *
  *   `hidePaths` replaces the built-in secret list when present; an empty array
  *   hides nothing. Patterns are VFS paths rooted at the mount, so the repo root is
  *   `/`, and a pattern containing `/` is rooted there for you. Hidden files report
- *   ENOENT for reads and writes alike. All keys merge per key, project scope over
- *   user scope.
+ *   ENOENT for reads and writes alike — tracked ones included, which is why a
+ *   hidden `.npmrc` shows in `git status` as deleted. All keys merge per key,
+ *   project scope over user scope.
  *
  *   Gondolin also exposes this tree under its own FUSE mount point, so the guest
  *   can reach it at /data/workspace as well as /workspace. That is the same
@@ -971,11 +981,85 @@ function sanitizeEnv(env: NodeJS.ProcessEnv | undefined): Record<string, string>
 	return result;
 }
 
+/**
+ * Guest paths that need a git `safe.directory` entry.
+ *
+ * `RealFSProvider` passes host ownership through the mount unchanged, so
+ * `/workspace` reports the host uid/gid (501/20 on macOS) while guest processes
+ * run as root. Git refuses any repo not owned by the effective uid, so every repo
+ * in the tree trips `fatal: detected dubious ownership`. Gondolin's VFS has no
+ * uid remap, so this has to be git config rather than a mount option.
+ *
+ * Shadowing host `.git` is not an escape hatch. `ShadowProvider`'s tmpfs upper
+ * layer is a host-side `MemoryProvider`, and its stats default uid/gid to the host
+ * pi process's own ids rather than to the guest's, so a guest-side `git init`
+ * under `hideGit` reports the host uid too and hits the same fatal. The
+ * exception therefore applies whether or not host `.git` is shadowed.
+ *
+ * Both spellings are required: the tree is also reachable under the FUSE mount,
+ * and git reports the repo under the path it was reached by, so a
+ * `/workspace`-only entry still leaves `git -C /data/workspace status` failing.
+ */
+const SAFE_DIRECTORY_PATHS = [GUEST_WORKSPACE, `${GUEST_FUSE_MOUNT}${GUEST_WORKSPACE}`];
+
+/**
+ * First pair index the caller left unused.
+ *
+ * git reads `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` for every `n` below
+ * `GIT_CONFIG_COUNT` and treats a missing pair as fatal: `GIT_CONFIG_COUNT=4`
+ * with only pairs 2 and 3 present gives `missing config key GIT_CONFIG_KEY_0` /
+ * `unable to parse command-line config` and kills the command. The range we hand
+ * over therefore has to be contiguous from 0.
+ *
+ * Counting *complete* pairs keeps it contiguous whatever the caller left behind.
+ * Deriving the index from a declared `GIT_CONFIG_COUNT` instead would extend a
+ * range whose earlier pairs are not in the environment we forward, and stopping
+ * only at a fully absent index would leave a half-present pair (key without
+ * value) inside the range we declare. Both turn the caller's git into a no-op.
+ */
+function firstUnusedConfigIndex(env: NodeJS.ProcessEnv | undefined): number {
+	const lookup = env ?? {};
+	let index = 0;
+	while (lookup[`GIT_CONFIG_KEY_${index}`] !== undefined && lookup[`GIT_CONFIG_VALUE_${index}`] !== undefined) {
+		index++;
+	}
+	return index;
+}
+
+/**
+ * Command-scope git config for guest commands, as environment variables.
+ *
+ * `GIT_CONFIG_COUNT` plus `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (git >= 2.31)
+ * is read as a config layer that outranks the repo's own, with no file writes.
+ * Env is the only scope that works reliably here: on the agent bash path pi
+ * forwards the host environment, so `$HOME` names the host home and does not
+ * exist in the guest, which is exactly where `git config --global` would have to
+ * write. The `!` user-bash path passes no env at all and keeps the guest's own
+ * `$HOME`, but a layer that works on both paths beats one that works on one.
+ *
+ * Appends after the caller's complete pairs (see `firstUnusedConfigIndex`) so an
+ * inherited layer survives; a caller count larger than its own pairs is dropped
+ * rather than carried into a fatal.
+ */
+function gitSafeDirectoryEnv(env: NodeJS.ProcessEnv | undefined): Record<string, string> {
+	const base = firstUnusedConfigIndex(env);
+	const injected: Record<string, string> = {};
+	SAFE_DIRECTORY_PATHS.forEach((safePath, index) => {
+		injected[`GIT_CONFIG_KEY_${base + index}`] = "safe.directory";
+		injected[`GIT_CONFIG_VALUE_${base + index}`] = safePath;
+	});
+	injected.GIT_CONFIG_COUNT = String(base + SAFE_DIRECTORY_PATHS.length);
+	return injected;
+}
+
 function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			if (signal?.aborted) throw new Error("aborted");
 			const guestCwd = toGuestPath(localCwd, cwd);
+			// Injected unconditionally: the shadow layer reports host ownership too, so
+			// a guest-created repo needs the exception as much as the mounted one does.
+			const guestEnv = { ...sanitizeEnv(env), ...gitSafeDirectoryEnv(env) };
 			const controller = new AbortController();
 			const onAbort = () => controller.abort();
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -992,7 +1076,7 @@ function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): Bas
 			try {
 				const proc = vm.exec([shellPath, "-lc", command], {
 					cwd: guestCwd,
-					env: sanitizeEnv(env),
+					env: guestEnv,
 					signal: controller.signal,
 					stdout: "pipe",
 					stderr: "pipe",
