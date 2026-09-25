@@ -18,6 +18,29 @@
  *   - Node.js >= 23.6.0 for @earendil-works/gondolin
  *   - QEMU installed (for example, `brew install qemu` on macOS)
  *
+ * Guest image selection:
+ *   By default the VM boots gondolin's own default image. To use a custom one,
+ *   the first of these that is set wins:
+ *
+ *     1. pi --gondolin-image <selector>
+ *     2. GONDOLIN_IMAGE=<selector>
+ *     3. <cwd>/.pi/gondolin.json      { "image": "<selector>" }
+ *     4. <agent-dir>/gondolin.json    { "image": "<selector>" }
+ *
+ *   A selector is a gondolin image ref (`name:tag`), a build id, or a directory
+ *   of built guest assets. Prefer a ref: `gondolin image import <dir> --tag
+ *   my:latest` repoints the ref on every rebuild, so the config survives
+ *   rebuilds, and refs resolve from the local store without touching the network.
+ *
+ *   Set the pin without editing JSON:
+ *     /gondolin image my:latest         # project (.pi/gondolin.json)
+ *     /gondolin image --user my:latest  # user  (<agent-dir>/gondolin.json)
+ *     /gondolin image clear             # remove the pin
+ *     /gondolin image --force my:latest # pin even when it does not resolve locally
+ *
+ *   `/gondolin` reports the booted image, where the selection came from, and the
+ *   asset directory it resolved to.
+ *
  * Local patch — guest clock sync. See syncGuestClock() below. The guest clock is
  * frozen while the VM is paused between requests and nothing re-syncs it on
  * resume, which breaks TLS after enough idle time. The host is the time
@@ -25,11 +48,13 @@
  * periodically after.
  */
 
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { RealFSProvider, VM } from "@earendil-works/gondolin";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { listImageRefs, RealFSProvider, resolveImageSelector, VM, type VMOptions } from "@earendil-works/gondolin";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
+	CONFIG_DIR_NAME,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -43,6 +68,7 @@ import {
 	formatSize,
 	type GrepToolDetails,
 	type GrepToolInput,
+	getAgentDir,
 	type LsOperations,
 	type ReadOperations,
 	truncateHead,
@@ -156,6 +182,165 @@ async function syncGuestClock(target: VM): Promise<GuestClockSync | undefined> {
 async function maybeSyncGuestClock(target: VM): Promise<void> {
 	if (Date.now() - clockSyncedAtHostMs < CLOCK_SYNC_MIN_INTERVAL_MS) return;
 	await syncGuestClock(target);
+}
+
+// ---------------------------------------------------------------------------
+// Guest image selection
+// ---------------------------------------------------------------------------
+
+/**
+ * A resolved image selector plus where it came from.
+ *
+ * The resolution order is silent — the source is the only way to tell *why* a
+ * given image booted, which matters because gondolin itself has fallbacks that
+ * look identical to "my setting had no effect".
+ */
+type ImageSelection = {
+	selector: string;
+	source: string;
+};
+
+/**
+ * Parsed contents of a Gondolin config file.
+ *
+ * "missing" and "invalid" are kept distinct on purpose. Absent is the normal case
+ * and safe to create over; a file that exists but cannot be read as a JSON object
+ * must never be overwritten, because the write path would then destroy content it
+ * cannot see.
+ */
+type ImageConfigFile = { kind: "missing" } | { kind: "invalid" } | { kind: "object"; value: Record<string, unknown> };
+
+function readImageConfigFile(configPath: string): ImageConfigFile {
+	let raw: string;
+	try {
+		raw = readFileSync(configPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			console.warn(`[gondolin] could not read config ${configPath}:`, error);
+			return { kind: "invalid" };
+		}
+		return { kind: "missing" };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		console.warn(`[gondolin] ignoring unparseable config ${configPath}:`, error);
+		return { kind: "invalid" };
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		console.warn(`[gondolin] ignoring config ${configPath}: expected a JSON object`);
+		return { kind: "invalid" };
+	}
+	return { kind: "object", value: parsed as Record<string, unknown> };
+}
+
+/** Read the pinned `image` selector from a Gondolin config file. */
+function readImageConfigSelector(configPath: string): string | undefined {
+	const file = readImageConfigFile(configPath);
+	if (file.kind !== "object") return undefined;
+	const image = file.value.image;
+	if (typeof image !== "string" || image.trim() === "") return undefined;
+	return image.trim();
+}
+
+function writeImageConfigObject(configPath: string, value: Record<string, unknown>): void {
+	mkdirSync(path.dirname(configPath), { recursive: true });
+	writeFileSync(configPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+/**
+ * Set or clear the pinned `image` key, leaving every other key in the file alone.
+ *
+ * This is a read-modify-write, not a whole-file replacement: the file is named
+ * `gondolin.json` and will accumulate settings this extension does not model, so
+ * a blind write would silently drop them. The file is unlinked only when removing
+ * the last remaining key.
+ *
+ * Returns false when the file exists but is not readable as a JSON object. The
+ * caller must surface that rather than overwrite it.
+ */
+function writeImageConfigSelector(configPath: string, selector: string | undefined): boolean {
+	const file = readImageConfigFile(configPath);
+	if (file.kind === "invalid") return false;
+	const existing = file.kind === "object" ? file.value : {};
+
+	if (selector === undefined) {
+		if (!Object.hasOwn(existing, "image")) return true;
+		const remaining: Record<string, unknown> = { ...existing };
+		delete remaining.image;
+		if (Object.keys(remaining).length === 0) {
+			try {
+				unlinkSync(configPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			return true;
+		}
+		writeImageConfigObject(configPath, remaining);
+		return true;
+	}
+
+	writeImageConfigObject(configPath, { ...existing, image: selector });
+	return true;
+}
+
+/**
+ * Classify a selector the way `resolveImageSelector` will read it.
+ *
+ * Gondolin tries the selector as a path first and falls through to build-id/ref
+ * handling when that path does not exist, so a typo'd path surfaces as a ref or
+ * build-id error and the shape is lost. Naming the shape up front is what makes a
+ * failure message actionable: paths are never downloaded, refs and build ids are.
+ */
+function classifyImageSelector(selector: string): "path" | "registry" {
+	const looksLikePath =
+		selector.startsWith("/") ||
+		selector.startsWith("~") ||
+		selector.startsWith(".") ||
+		selector.includes("/") ||
+		selector.includes("\\");
+	return looksLikePath ? "path" : "registry";
+}
+
+type ImageResolution = { ok: true; detail: string } | { ok: false; registryResolvable: boolean; detail: string };
+
+/**
+ * Resolve a selector against the local image store without downloading.
+ *
+ * `resolveImageSelector` is sync and never touches the network, so `ok: false`
+ * means "not on this machine", not "does not exist". A `name:tag` ref or build id
+ * can still boot by pulling from the builtin registry; a path cannot.
+ */
+function tryResolveImageSelector(selector: string): ImageResolution {
+	try {
+		const resolved = resolveImageSelector(selector);
+		const details = [
+			resolved.source,
+			resolved.arch ?? "unknown arch",
+			resolved.buildId?.slice(0, 8) ?? "no build id",
+		];
+		return { ok: true, detail: `${details.join(", ")} -> ${resolved.assetDir}` };
+	} catch (error) {
+		const reason = (error as Error).message;
+		if (classifyImageSelector(selector) === "path") {
+			return {
+				ok: false,
+				registryResolvable: false,
+				detail: `not a usable local asset directory, and paths are never downloaded (${reason})`,
+			};
+		}
+		return {
+			ok: false,
+			registryResolvable: true,
+			detail: `not in the local store; the boot will try the builtin registry (${reason})`,
+		};
+	}
+}
+
+/** One-line description of what a selector resolves to locally. */
+function describeResolvedImage(selector: string): string {
+	return tryResolveImageSelector(selector).detail;
 }
 
 type TextToolResult<TDetails> = {
@@ -483,20 +668,247 @@ export default function (pi: ExtensionAPI) {
 	const localFind = createFindTool(localCwd);
 	const localLs = createLsTool(localCwd);
 
+	pi.registerFlag("gondolin-image", {
+		description: "Gondolin guest image selector: name:tag ref, build id, or built asset directory",
+		type: "string",
+	});
+
 	let vm: VM | undefined;
 	let vmStarting: Promise<VM> | undefined;
 	let shellPath = "/bin/sh";
+	/** The selection the running VM booted with, so status can diff it against config. */
+	let bootedImage: ImageSelection | undefined;
+
+	/**
+	 * Config files for a project cwd. Project first: a repo can pin its own image
+	 * over a personal default.
+	 *
+	 * The project path comes from the caller's cwd, not from the mount root. The
+	 * mount and every path mapping in `toGuestPath` are pinned to `localCwd`,
+	 * captured at extension load, because a guest mount must not move underneath a
+	 * running session. Config resolution is a different question and follows the
+	 * session's project instead.
+	 */
+	function imageConfigPaths(projectCwd: string): { project: string; user: string } {
+		return {
+			project: path.join(projectCwd, CONFIG_DIR_NAME, "gondolin.json"),
+			user: path.join(getAgentDir(), "gondolin.json"),
+		};
+	}
+
+	/**
+	 * Resolve the guest image selector for a VM start. First hit wins:
+	 * `--gondolin-image` > `GONDOLIN_IMAGE` > project config > user config.
+	 * Undefined means "let gondolin use its own default".
+	 *
+	 * First-wins-per-file is deliberate while this config is single-key: a project
+	 * pin is meant to replace the user pin outright, not blend with it. If a second
+	 * key is ever added to gondolin.json, switch to a merge (as the `sandbox` and
+	 * `preset` examples do) or a project pin will silently discard the user's
+	 * other settings.
+	 */
+	function resolveImageSelection(projectCwd: string): ImageSelection | undefined {
+		const flag = pi.getFlag("gondolin-image");
+		if (typeof flag === "string" && flag.trim() !== "") {
+			return { selector: flag.trim(), source: "--gondolin-image" };
+		}
+		const envSelector = process.env.GONDOLIN_IMAGE;
+		if (envSelector && envSelector.trim() !== "") {
+			return { selector: envSelector.trim(), source: "GONDOLIN_IMAGE" };
+		}
+		const { project, user } = imageConfigPaths(projectCwd);
+		const projectSelector = readImageConfigSelector(project);
+		if (projectSelector) return { selector: projectSelector, source: project };
+		const userSelector = readImageConfigSelector(user);
+		if (userSelector) return { selector: userSelector, source: user };
+		return undefined;
+	}
+
+	/** Locally imported image refs, for `/gondolin image` completions and usage text. */
+	function localImageRefs(): string[] {
+		try {
+			return listImageRefs().map((ref) => ref.reference);
+		} catch (error) {
+			console.warn("[gondolin] could not list local image refs:", error);
+			return [];
+		}
+	}
+
+	const IMAGE_USAGE = "Usage: /gondolin image [selector|clear] [--user] [--force]";
+
+	/**
+	 * Report a config file this extension refused to overwrite.
+	 *
+	 * `writeImageConfigSelector` returns false when the file exists but is not
+	 * readable as a JSON object. Overwriting it would destroy content this
+	 * extension cannot see, so the only safe fix is a human editing the file.
+	 */
+	function notifyUnwritableConfig(configPath: string, ctx: ExtensionCommandContext): void {
+		ctx.ui.notify(
+			`Could not update ${configPath}: it exists but is not readable as a JSON object. Fix or remove it by hand.`,
+			"error",
+		);
+	}
+
+	/** Parsed `/gondolin image` arguments. */
+	type ImageCommandArgs = {
+		scope: "user" | "project";
+		force: boolean;
+		values: string[];
+		unknownFlags: string[];
+	};
+
+	/**
+	 * Split `/gondolin image` arguments into flags and values.
+	 *
+	 * A token that starts with "-" and is not a known flag lands in `unknownFlags`
+	 * rather than `values`: silently pinning "--usr" as an image name is worse
+	 * than refusing the command.
+	 */
+	function parseImageCommandArgs(args: string): ImageCommandArgs {
+		const tokens = args.split(/\s+/).filter(Boolean);
+		const knownFlags = new Set(["--user", "--force"]);
+		const values = tokens.filter((token) => !knownFlags.has(token));
+		return {
+			scope: tokens.includes("--user") ? "user" : "project",
+			force: tokens.includes("--force"),
+			values,
+			unknownFlags: values.filter((value) => value.startsWith("-")),
+		};
+	}
+
+	/**
+	 * `/gondolin image [selector|clear] [--user] [--force]`
+	 *
+	 * Writes the pin to a config file so later sessions pick it up without any
+	 * flag or environment variable. The running VM keeps the image it booted with;
+	 * this only affects the next start.
+	 *
+	 * The selector is resolved before anything is written. A pin is persisted and
+	 * only bites at the next boot, so an unresolvable selector is reported here
+	 * rather than stored away to fail later.
+	 */
+	function handleImageCommand(args: string, ctx: ExtensionCommandContext): void {
+		const { scope, force, values, unknownFlags } = parseImageCommandArgs(args);
+		const paths = imageConfigPaths(ctx.cwd);
+		const targetPath = scope === "user" ? paths.user : paths.project;
+
+		if (unknownFlags.length > 0) {
+			ctx.ui.notify(`${IMAGE_USAGE}\nUnknown flag: ${unknownFlags.join(", ")}`, "warning");
+			return;
+		}
+
+		if (values.length === 0) {
+			const pinned = readImageConfigSelector(targetPath);
+			ctx.ui.notify(
+				pinned
+					? `Pinned ${scope} image: ${pinned} (${targetPath})\n${describeResolvedImage(pinned)}`
+					: `No ${scope} image pinned in ${targetPath}.`,
+				"info",
+			);
+			return;
+		}
+		if (values.length > 1) {
+			const refs = localImageRefs().join(", ") || "none imported yet";
+			ctx.ui.notify(`${IMAGE_USAGE}\nLocal refs: ${refs}`, "warning");
+			return;
+		}
+
+		const value = values[0] ?? "";
+		if (value === "clear") {
+			if (!writeImageConfigSelector(targetPath, undefined)) {
+				notifyUnwritableConfig(targetPath, ctx);
+				return;
+			}
+			const next = resolveImageSelection(ctx.cwd);
+			ctx.ui.notify(
+				`Cleared ${scope} image pin (${targetPath}). Next VM: ${
+					next ? `${next.selector} (${next.source})` : "gondolin default"
+				}.`,
+				"info",
+			);
+			return;
+		}
+
+		const resolution = tryResolveImageSelector(value);
+		if (!resolution.ok && !force) {
+			const refs = localImageRefs().join(", ") || "none imported yet";
+			const hint = resolution.registryResolvable
+				? "A ref or build id that is not imported yet can still boot by pulling from the " +
+					"builtin registry. Re-run with --force to pin it anyway."
+				: "Re-run with --force to pin it anyway.";
+			ctx.ui.notify(
+				[`Refused to pin ${value}: ${resolution.detail}`, hint, `Local refs: ${refs}`].join("\n"),
+				"warning",
+			);
+			return;
+		}
+
+		if (!writeImageConfigSelector(targetPath, value)) {
+			notifyUnwritableConfig(targetPath, ctx);
+			return;
+		}
+
+		ctx.ui.notify(
+			[
+				`Pinned image ${value} in ${targetPath}.`,
+				resolution.detail,
+				`Applies to the next VM; this one keeps ${bootedImage ? bootedImage.selector : "the gondolin default"}.`,
+			].join("\n"),
+			resolution.ok ? "info" : "warning",
+		);
+	}
+
+	/**
+	 * Complete `/gondolin <TAB>` and `/gondolin image <TAB>`.
+	 *
+	 * The harness replaces the whole argument text with `item.value`, so every
+	 * value repeats the `image ` subcommand.
+	 */
+	function imageArgumentCompletions(
+		argumentText: string,
+	): Array<{ value: string; label: string; description?: string }> | null {
+		const spaceIndex = argumentText.search(/\s/);
+		// Still typing the subcommand word itself.
+		if (spaceIndex === -1) {
+			return "image".startsWith(argumentText)
+				? [{ value: "image", label: "image", description: "select the guest image" }]
+				: null;
+		}
+		if (argumentText.slice(0, spaceIndex) !== "image") return null;
+		// Split without trimming so a trailing space means "complete a new token" and
+		// the already-typed tokens stay where they are.
+		const tokens = argumentText.slice(spaceIndex + 1).split(/\s+/);
+		const partial = tokens.at(-1) ?? "";
+		const kept = tokens.slice(0, -1).filter(Boolean);
+		const candidates = ["clear", "--user", "--force", ...localImageRefs()];
+		return candidates
+			.filter((candidate) => candidate.startsWith(partial) && !kept.includes(candidate))
+			.map((candidate) => ({
+				value: ["image", ...kept, candidate].join(" "),
+				label: candidate,
+			}));
+	}
 
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
 		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
-		const created = await VM.create({
+		const selection = resolveImageSelection(ctx?.cwd ?? localCwd);
+		const vmOptions: VMOptions = {
 			sessionLabel: `pi ${path.basename(localCwd)}`,
 			vfs: {
 				mounts: {
 					[GUEST_WORKSPACE]: new RealFSProvider(localCwd),
 				},
 			},
-		});
+		};
+		// A string selector resolves against the local image store first and only
+		// pulls from the builtin registry on a local miss.
+		if (selection) vmOptions.sandbox = { imagePath: selection.selector };
+		const created = await VM.create(vmOptions);
+		// Only once the boot succeeded. Assigning this earlier leaves `/gondolin`
+		// reporting an image that never booted if VM.create throws, or while a
+		// registry pull is still in flight.
+		bootedImage = selection;
 		// Before anything that could open a socket: a stale guest clock turns every
 		// freshly minted cert into CERT_NOT_YET_VALID.
 		const clock = await syncGuestClock(created);
@@ -516,7 +928,8 @@ export default function (pi: ExtensionAPI) {
 			"gondolin",
 			ctx.ui.theme.fg("accent", `Gondolin: ${created.id.slice(0, 8)} (${GUEST_WORKSPACE})`),
 		);
-		ctx?.ui.notify(`Gondolin VM ready. ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
+		const imageNote = selection ? `image ${selection.selector}` : "gondolin default image";
+		ctx?.ui.notify(`Gondolin VM ready (${imageNote}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
 		return created;
 	}
 
@@ -548,8 +961,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("gondolin", {
-		description: "Show Gondolin VM status",
-		handler: async (_args, ctx) => {
+		description: "Show Gondolin VM status, or select the guest image",
+		getArgumentCompletions: imageArgumentCompletions,
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			if (trimmed === "image" || trimmed.startsWith("image ")) {
+				handleImageCommand(trimmed.slice("image".length).trim(), ctx);
+				return;
+			}
 			const activeVm = await ensureVm(ctx);
 			const clock = await syncGuestClock(activeVm);
 			let driftLabel = "unknown";
@@ -560,16 +979,25 @@ export default function (pi: ExtensionAPI) {
 					driftLabel += clock.applied ? " (corrected)" : " (correction failed)";
 				}
 			}
-			ctx.ui.notify(
-				[
-					`Gondolin VM: ${activeVm.id}`,
-					`Host workspace: ${localCwd}`,
-					`Guest workspace: ${GUEST_WORKSPACE}`,
-					`Shell: ${shellPath}`,
-					`Guest clock: ${driftLabel}`,
-				].join("\n"),
-				"info",
-			);
+			// Show the booted image and the current config separately: they differ
+			// whenever the pin changed after this VM started, and "which image am I in"
+			// is otherwise unanswerable.
+			const current = resolveImageSelection(ctx.cwd);
+			const lines = [
+				`Gondolin VM: ${activeVm.id}`,
+				`Host workspace: ${localCwd}`,
+				`Guest workspace: ${GUEST_WORKSPACE}`,
+				`Shell: ${shellPath}`,
+				`Image (booted): ${
+					bootedImage ? `${bootedImage.selector} from ${bootedImage.source}` : "gondolin default"
+				}`,
+				bootedImage ? describeResolvedImage(bootedImage.selector) : undefined,
+				`Guest clock: ${driftLabel}`,
+			];
+			if (current && current.selector !== bootedImage?.selector) {
+				lines.push(`Image (configured): ${current.selector} from ${current.source} — applies to the next VM`);
+			}
+			ctx.ui.notify(lines.filter((line): line is string => line !== undefined).join("\n"), "info");
 		},
 	});
 
