@@ -80,7 +80,9 @@
  *   provider behind a bind mount, so this policy applies there too.
  *
  *   See "Workspace visibility policy" below for matching rules and what each
- *   mode does to reads and writes.
+ *   mode does to reads and writes, and WORKSPACE_VISIBILITY.md next to this file
+ *   for the inventory of non-portable build directories across ecosystems and the
+ *   proposed config shape if these keys keep growing.
  *
  * Local patch — guest clock sync. See syncGuestClock() below. The guest clock is
  * frozen while the VM is paused between requests and nothing re-syncs it on
