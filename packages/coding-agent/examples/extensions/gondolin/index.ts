@@ -131,15 +131,57 @@
  *   unreadable: the flag looked ignored while a file the caller was not looking at
  *   quietly supplied the size. See `firstConfigured`.
  *
- *   Swap is not configurable. Gondolin 0.12.0 has no swap option and never
- *   creates a swap device, so the guest runs with 0 swap (`/proc/swaps` is empty)
- *   and an OOM is a hard kill rather than a slowdown. Adding swap needs an
- *   upstream gondolin feature — a second disk plus `mkswap`/`swapon` at boot — not
- *   an extension change.
- *
  *   Both values are fixed at boot. Editing the config mid-session affects only the
  *   next VM, the same way the image pin and visibility policy do; `/gondolin`
  *   shows the booted values and the configured ones when they differ.
+ *
+ * Guest storage: two things push caches into guest RAM.
+ *
+ *   The image mounts HOME (`/root`), /tmp, /var/tmp, /var/cache and /var/log as
+ *   tmpfs, so a Chromium profile or an npm cache is guest RAM, and tmpfs pages
+ *   are unreclaimable without swap.
+ *
+ *   pi's environment forwarding is the harsher of the two. The agent bash path
+ *   forwards the host environment, so `TMPDIR` and `HOME` arrive as host macOS
+ *   paths with no guest counterpart: with `TMPDIR=/var/folders/...` inherited,
+ *   `touch "$TMPDIR/x"` fails with `No such file or directory` rather than
+ *   merely costing RAM. The image exports none of these variables itself —
+ *   /etc/profile and /etc/profile.d set PATH, PAGER, umask, PS1 and locale
+ *   defaults and nothing else — so whatever the host has is what the guest runs
+ *   with.
+ *
+ *   The extension changes this three ways, keyed in the same gondolin.json
+ *   files. Each key also takes `false` or `"off"` to disable it, which is the
+ *   escape hatch if one breaks a workflow. The CLI overrides are
+ *   `--gondolin-swap` and `--gondolin-tmpfs-cap` (a size, or `off`) and the
+ *   valueless boolean `--gondolin-no-scratch`.
+ *
+ *   `scratchRedirect` (default on) creates `/scratch` on the disk-backed root
+ *   and points TMPDIR, the three XDG dirs and `UV_CACHE_DIR` at it for every
+ *   guest command. That fixes the missing-path failure and moves the same bytes
+ *   into reclaimable page cache instead of pinned shmem: 64 MB written to `/`
+ *   left `Mem: used` unchanged and showed up entirely in `buff/cache`, at
+ *   ~660 MB/s through the overlay.
+ *
+ *   `tmpfsCap` (default RAM/8, floor 32M) caps /tmp, /var/tmp, /var/cache and
+ *   /var/log, covering tools that hardcode those paths instead of honouring
+ *   TMPDIR. Overflow becomes ENOSPC on one write rather than a guest-wide OOM.
+ *
+ *   `swap` (default: half the guest's RAM) adds a zram device, compressed
+ *   RAM-backed swap. This is the only mitigation for anonymous memory — the heap
+ *   and stack a Chromium renderer actually runs on — which neither of the above
+ *   can reach, because heap and stack pages have no file to be evicted from.
+ *   Idle cost is near zero: a device with nothing swapped reports an empty zram
+ *   pool, 12 KB. The size is a ceiling rather than a commitment, but a ceiling
+ *   that costs about 55-68% of everything it lets in at the ratios measured on
+ *   this image — see `resolveSwapMiB` for why the default is half of RAM rather
+ *   than all of it.
+ *
+ *   Gondolin has no swap option and wires exactly one disk (`drive0`), so a
+ *   *dedicated* swap disk would need upstream. None is needed here: zram is
+ *   RAM-backed and wants no disk at all, which is why the extension uses it
+ *   rather than a swap file on the existing root. All three are fixed at boot,
+ *   like the image pin.
  *
  * Local patch — guest clock sync. See syncGuestClock() below. The guest clock is
  * frozen while the VM is paused between requests and nothing re-syncs it on
@@ -868,6 +910,26 @@ const MEMORY_UNIT_BYTES: Record<string, number> = {
  */
 const MIN_MEMORY_BYTES = 1024 * 1024;
 
+/**
+ * Bytes for a `<digits><K|M|G|T>` string, or undefined if it does not parse.
+ *
+ * Shared by `memory` and the storage size keys so one parser decides what a size
+ * means, and neither caller has to re-derive the unit arithmetic.
+ */
+function sizeToBytes(value: string): number | undefined {
+	const match = MEMORY_PATTERN.exec(value);
+	if (!match) return undefined;
+	const unit = MEMORY_UNIT_BYTES[match[2].toUpperCase()] ?? Number.NaN;
+	const bytes = Number(match[1]) * unit;
+	return Number.isFinite(bytes) ? bytes : undefined;
+}
+
+/** MiB for a validated size string. */
+function sizeToMiB(value: string): number | undefined {
+	const bytes = sizeToBytes(value);
+	return bytes === undefined ? undefined : Math.round(bytes / (1024 * 1024));
+}
+
 /** QEMU `-smp` and the krun backend both cap the guest at 255 vCPUs. */
 const MAX_CPUS = 255;
 
@@ -903,8 +965,8 @@ function parseMemoryValue(value: unknown, source: string, problems: string[]): s
 		);
 		return undefined;
 	}
-	const bytes = Number(match[1]) * (MEMORY_UNIT_BYTES[match[2].toUpperCase()] ?? Number.NaN);
-	if (!Number.isFinite(bytes) || bytes < MIN_MEMORY_BYTES) {
+	const bytes = sizeToBytes(trimmed);
+	if (bytes === undefined || bytes < MIN_MEMORY_BYTES) {
 		problems.push(`ignoring memory from ${source}: "${trimmed}" is below the 1M minimum a guest can boot with`);
 		return undefined;
 	}
@@ -937,6 +999,322 @@ function resourceValueLabel(
 ): string {
 	if (value === undefined) return `${fallback} (gondolin default, ${source ?? "defaults"})`;
 	return `${value} (${source ?? "defaults"})`;
+}
+
+// ---------------------------------------------------------------------------
+// Guest storage
+// ---------------------------------------------------------------------------
+
+/**
+ * Guest scratch tree on the disk-backed root, not tmpfs.
+ *
+ * `/` is `/dev/vda` ext4 backed by a host qcow2 copy-on-write overlay
+ * (gondolin `vm/core.js:1645-1653`, `deleteOnClose: true`), so writes here cost
+ * host disk and reclaimable page cache rather than pinned guest RAM, and still
+ * disappear when the VM closes.
+ */
+const GUEST_SCRATCH = "/scratch";
+
+/**
+ * tmpfs mounts given a size cap.
+ *
+ * `/run` is deliberately left alone: it holds sockets and service state, and a cap
+ * there risks breaking the guest to protect RAM that is not being consumed there.
+ */
+const CAP_MOUNTS = ["/tmp", "/var/tmp", "/var/cache", "/var/log"];
+
+/**
+ * Cache and temp locations redirected at the scratch tree, per guest command.
+ *
+ * These are overrides, not defaults. pi forwards the host environment to guest
+ * commands, so each of these already names a host value by the time it reaches
+ * the guest, and `TMPDIR` is the worst case: a macOS path with no guest
+ * counterpart, so temp writes fail outright instead of merely consuming RAM.
+ * Chromium and most other tools follow XDG, so overriding those moves the whole
+ * profile onto the disk-backed root: measured, 64 MB written to `/` left
+ * `Mem: used` unchanged and showed up entirely in `buff/cache`, which the kernel
+ * can reclaim.
+ *
+ * `HOME` is deliberately not redirected, and that leaves a known gap rather than
+ * a solved problem: it still names a host path the guest cannot see, so anything
+ * writing to `~` fails. Redirecting it would move the npm global prefix and every
+ * tool's own dotfile location along with it, which is a larger behavioural
+ * change than moving a cache and not one to make silently. Note that
+ * `gitSafeDirectoryEnv` does not cover this: it injects `safe.directory` for
+ * git's ownership check and says nothing about where git reads config from.
+ */
+const GUEST_CACHE_ENV: Record<string, string> = {
+	TMPDIR: `${GUEST_SCRATCH}/tmp`,
+	XDG_CACHE_HOME: `${GUEST_SCRATCH}/.cache`,
+	XDG_CONFIG_HOME: `${GUEST_SCRATCH}/.config`,
+	XDG_DATA_HOME: `${GUEST_SCRATCH}/.local/share`,
+	UV_CACHE_DIR: `${GUEST_SCRATCH}/.cache/uv`,
+};
+
+/** Anything meaning "do not do this at all" for a size tunable. */
+const SWITCH_OFF_WORDS = new Set(["off", "none", "no", "disable", "disabled"]);
+
+/**
+ * Parse a size tunable that may also be turned off.
+ *
+ * `false` and `"off"` exist because these are behavioural changes to a working
+ * guest. If a tmpfs cap or a swap device breaks something, it has to be
+ * switchable without editing the extension.
+ *
+ * `key` names the config key in the problem text. `source` only says which layer
+ * won the ladder ("project config"), and several keys share one layer, so a
+ * message without the key cannot say which setting got dropped — `parseMemoryValue`
+ * spells its key out for the same reason.
+ */
+function parseSizeOrOff(key: string, value: unknown, source: string, problems: string[]): string | "off" | undefined {
+	if (value === undefined) return undefined;
+	if (value === false) return "off";
+	if (typeof value === "number" && value === 0) return "off";
+	const trimmed = typeof value === "string" ? value.trim() : "";
+	if (SWITCH_OFF_WORDS.has(trimmed.toLowerCase())) return "off";
+	const bytes = sizeToBytes(trimmed);
+	if (bytes === undefined || bytes < MIN_MEMORY_BYTES) {
+		problems.push(
+			`ignoring ${key} from ${source}: expected a size like "512M" or false/"off", got ${JSON.stringify(value)}`,
+		);
+		return undefined;
+	}
+	return trimmed;
+}
+
+/** Validate a boolean config value. `key` is named for the same reason as in `parseSizeOrOff`. */
+function parseBooleanValue(key: string, value: unknown, source: string, problems: string[]): boolean | undefined {
+	if (typeof value !== "boolean") {
+		problems.push(`ignoring ${key} from ${source}: expected true or false, got ${JSON.stringify(value)}`);
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * Guest storage tuning. An absent size key means "derive from the guest's own
+ * RAM", which is only known after boot — hence `effective`.
+ */
+type StorageConfig = {
+	scratchRedirect: boolean;
+	/** A size string, `"off"`, or undefined to derive. */
+	swap?: string;
+	/** A size string, `"off"`, or undefined to derive. */
+	tmpfsCap?: string;
+};
+
+type StorageState = {
+	storage: StorageConfig;
+	sources: { scratchRedirect?: string; swap?: string; tmpfsCap?: string };
+	/** Invalid values that were dropped, as human-readable sentences. */
+	problems: string[];
+	/** Sizes actually applied at boot, after deriving from the guest's RAM. */
+	effective?: { scratchRedirect: boolean; swapMiB?: number; tmpfsCapMiB?: number };
+};
+
+/** Compact form used to diff the booted storage tuning against the configured. */
+function storageSummary(storage: StorageConfig): string {
+	const swap = storage.swap ?? "derived";
+	const cap = storage.tmpfsCap ?? "derived";
+	return `scratchRedirect=${storage.scratchRedirect}, swap=${swap}, tmpfsCap=${cap}`;
+}
+
+/**
+ * Resolve the swap size to apply, in MiB, or undefined for "no swap".
+ *
+ * Derived as half the guest's RAM. A zram device's size is not idle cost — it is
+ * the ceiling on how much the kernel may swap, and zram converts that ceiling into
+ * RAM at the compression ratio, allocating from the same pool it is relieving.
+ * Measured on the booted guest with `lzo-rle` (its default algorithm), pushing
+ * real data through `madvise(MADV_PAGEOUT)` so only the test pages were swapped:
+ *
+ *     varied text (js/json/py/sh)  2.06:1   55% of swapped bytes held in RAM
+ *     ELF binary (node)            1.55:1   68%
+ *     incompressible (urandom)     1.00:1   100%
+ *
+ * A device sized at the full guest RAM therefore permits a worst case of roughly
+ * two thirds of total RAM held by zram, at which point paging anything back in
+ * competes against memory zram is already pinning — thrash, not the graceful
+ * slowdown swap is for. Half of RAM bounds that to about a third of total and
+ * still leaves more swapped than a 1G guest is likely to need.
+ *
+ * The other bound, if it is ever wanted, is zram's own `mem_limit`: it caps the
+ * RAM cost independently of the device size and reads back as field 4 of
+ * `mm_stat`. Deliberately not used here — the simpler knob is the device size.
+ */
+function resolveSwapMiB(storage: StorageConfig, guestMemMiB: number): number | undefined {
+	const derived = Math.floor(guestMemMiB / 2);
+	if (storage.swap === undefined) return derived;
+	if (storage.swap === "off") return undefined;
+	return sizeToMiB(storage.swap) ?? derived;
+}
+
+/** Resolve the tmpfs cap to apply, in MiB, or undefined for "leave them uncapped". */
+function resolveTmpfsCapMiB(storage: StorageConfig, guestMemMiB: number): number | undefined {
+	if (storage.tmpfsCap === undefined) return Math.max(32, Math.floor(guestMemMiB / 8));
+	if (storage.tmpfsCap === "off") return undefined;
+	return sizeToMiB(storage.tmpfsCap) ?? Math.max(32, Math.floor(guestMemMiB / 8));
+}
+
+/**
+ * Outcome of a guest maintenance script.
+ *
+ * `ok: false` means the `exec` itself never got a result — the VM went away, the
+ * exec channel failed — which is a different thing from the script running and
+ * exiting non-zero, and needs a different message.
+ */
+type GuestScriptResult = { ok: true; exitCode: number; stdout: string } | { ok: false; reason: string };
+
+/**
+ * Run a guest maintenance script without letting a rejected `exec` propagate.
+ *
+ * Every storage tuning call goes through here for the reason `syncGuestClock`
+ * gives for itself: these run during VM startup, where a rejected `exec` would
+ * discard a VM that booted fine and leave `bootedImage`, `bootedPolicy` and
+ * `bootedResources` describing a VM the session never received. The tuning is
+ * best-effort, so a transport failure is handed back for the caller to report.
+ */
+async function runGuestScript(target: VM, script: string): Promise<GuestScriptResult> {
+	try {
+		const result = await target.exec(["/bin/sh", "-lc", script]);
+		return { ok: true, exitCode: result.exitCode, stdout: result.stdout };
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		console.warn(`[gondolin] guest command did not run (${script}):`, error);
+		return { ok: false, reason };
+	}
+}
+
+/**
+ * Guest MiB of RAM, read from the guest rather than assumed.
+ *
+ * The configured `memory` may be unset and therefore gondolin's default, and the
+ * derived swap and tmpfs numbers want the real figure the guest booted with.
+ */
+async function readGuestMemMiB(target: VM): Promise<number | undefined> {
+	// Field 2 of the MemTotal line, named rather than digit-stripped: replacing
+	// every non-digit in the line would concatenate any other digits it happens to
+	// carry and still return a plausible-looking number.
+	const result = await runGuestScript(target, "awk '/MemTotal/ {print $2}' /proc/meminfo");
+	if (!result.ok) return undefined;
+	const kib = Number.parseInt(result.stdout.trim(), 10);
+	if (!Number.isFinite(kib) || kib <= 0) return undefined;
+	return Math.floor(kib / 1024);
+}
+
+/**
+ * Create the scratch tree the redirected cache paths live in.
+ *
+ * A failure here must disable the redirect rather than leave it installed: with
+ * `TMPDIR` and the XDG dirs pointing at a `/scratch` that was never created,
+ * every temp write in the session fails with ENOENT, which is worse than the
+ * tmpfs default the redirect replaces. `applyStorageTuning` therefore treats a
+ * problem from this function as "scratch is off for this VM".
+ */
+async function createGuestScratch(target: VM): Promise<string | undefined> {
+	const dirs = ["tmp", ".cache", ".config", ".local/share", ".cache/uv"]
+		.map((leaf) => `${GUEST_SCRATCH}/${leaf}`)
+		.join(" ");
+	const script = `mkdir -p ${dirs} && chmod 700 ${GUEST_SCRATCH}`;
+	const result = await runGuestScript(target, script);
+	if (!result.ok) return `guest scratch setup failed (${result.reason})`;
+	return result.exitCode === 0 ? undefined : `guest scratch setup failed (exit ${result.exitCode})`;
+}
+
+/**
+ * Cap the tmpfs mounts so a tool that ignores TMPDIR cannot grow into an OOM.
+ *
+ * Verified in-guest: a 32M-capped tmpfs fails a 40M write with `No space left on
+ * device` at the boundary, which is a per-write error rather than a killed guest.
+ */
+async function capGuestTmpfs(target: VM, capMiB: number): Promise<string[]> {
+	// The mount error is folded into the failure line instead of being left on
+	// stderr: `runGuestScript` reports stdout, so an unredirected `mount` error
+	// would vanish and leave a bare "cap /tmp failed" as the only thing anyone
+	// ever sees. Verified in-guest — this shape yields
+	// `cap /x failed: mount: can't find /x in /proc/mounts` on failure and prints
+	// nothing on success, which is what the "failed" filter below keys on.
+	const capLines = CAP_MOUNTS.map(
+		(mount) => `out=$(mount -o remount,size=${capMiB}M ${mount} 2>&1) || echo "cap ${mount} failed: $out"`,
+	);
+	const script = capLines.join("; ");
+	const result = await runGuestScript(target, script);
+	if (!result.ok) return [`guest tmpfs cap failed (${result.reason})`];
+	const problems = result.stdout
+		.split("\n")
+		.filter((line) => line.includes("failed"))
+		.map((line) => line.trim());
+	if (problems.length === 0 && result.exitCode !== 0) {
+		problems.push(`guest tmpfs cap failed (exit ${result.exitCode})`);
+	}
+	return problems;
+}
+
+/**
+ * Add a zram device as compressed RAM-backed swap.
+ *
+ * Every guard ends in `exit 0` deliberately. A guest without the zram module, or
+ * one that refuses the swapon, must degrade to today's behaviour rather than
+ * break the boot — the same rule `syncGuestClock` follows.
+ *
+ * The idle cost is what makes this safe to default on: a device with nothing
+ * swapped reports an empty zram pool (`mm_stat` all zeros, 12 KB resident),
+ * because zram allocates only for data it actually stores.
+ */
+async function enableZramSwap(target: VM, sizeMiB: number): Promise<string | undefined> {
+	const script = [
+		"if [ \"$(awk 'NR>1 {n++} END {print n+0}' /proc/swaps)\" != 0 ]; then exit 0; fi",
+		"modprobe zram >/dev/null 2>&1 || { echo 'no zram module available'; exit 0; }",
+		`echo ${sizeMiB}M > /sys/block/zram0/disksize || { echo 'zram disksize failed'; exit 0; }`,
+		"mkswap /dev/zram0 >/dev/null || { echo 'zram mkswap failed'; exit 0; }",
+		"swapon /dev/zram0 || { echo 'zram swapon failed'; exit 0; }",
+	].join("; ");
+	const result = await runGuestScript(target, script);
+	if (!result.ok) return `swap: zram setup failed (${result.reason})`;
+	const line = result.stdout.trim();
+	return line === "" ? undefined : `swap: ${line}`;
+}
+
+/**
+ * What the guest actually has swapped, read back rather than assumed.
+ *
+ * Same reason the clock sync reads the clock after stepping it: an exit status is
+ * not evidence. This reports the device and size the kernel agreed to.
+ *
+ * An unreadable table reports `unknown`, not `none`. "No swap" and "could not
+ * check for swap" lead to different follow-up actions and must not print the same
+ * thing.
+ */
+async function readSwapSummary(target: VM): Promise<string> {
+	const result = await runGuestScript(target, "cat /proc/swaps");
+	if (!result.ok) return `unknown (${result.reason})`;
+	const lines = result.stdout
+		.split("\n")
+		.slice(1)
+		.filter((line) => line.trim() !== "");
+	if (lines.length === 0) return "none";
+	const fields = lines.map((line) => line.split(/\s+/));
+	const totalMiB = Math.round(fields.reduce((sum, f) => sum + (Number.parseInt(f[2] ?? "0", 10) || 0), 0) / 1024);
+	return `${totalMiB} MiB (${fields.map((f) => f[0] ?? "?").join(", ")})`;
+}
+
+/**
+ * The tmpfs caps actually present in the guest mount table.
+ *
+ * `unknown` when the table could not be read, for the same reason as
+ * `readSwapSummary`.
+ */
+async function readTmpfsCapSummary(target: VM): Promise<string> {
+	const result = await runGuestScript(target, "cat /proc/mounts");
+	if (!result.ok) return `unknown (${result.reason})`;
+	const lines = result.stdout.split("\n");
+	const caps = CAP_MOUNTS.map((mount) => {
+		const entry = lines.find((line) => line.split(/\s+/)[1] === mount);
+		if (!entry) return `${mount} not mounted`;
+		const sizeKib = /(?:^|,)size=(\d+)k/.exec(entry)?.[1];
+		return `${mount} ${sizeKib ? `${Math.round(Number(sizeKib) / 1024)}M` : "uncapped"}`;
+	});
+	return caps.join(", ");
 }
 
 type TextToolResult<TDetails> = {
@@ -1284,14 +1662,31 @@ function gitSafeDirectoryEnv(env: NodeJS.ProcessEnv | undefined): Record<string,
 	return injected;
 }
 
-function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): BashOperations {
+function createGondolinBashOps(
+	vm: VM,
+	localCwd: string,
+	shellPath: string,
+	cacheEnv: Record<string, string>,
+): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			if (signal?.aborted) throw new Error("aborted");
 			const guestCwd = toGuestPath(localCwd, cwd);
 			// Injected unconditionally: the shadow layer reports host ownership too, so
 			// a guest-created repo needs the exception as much as the mounted one does.
-			const guestEnv = { ...sanitizeEnv(env), ...gitSafeDirectoryEnv(env) };
+			// `cacheEnv` sits between the two so the redirect outranks a host-forwarded
+			// XDG_CACHE_HOME but cannot clobber the git layer.
+			//
+			// This ordering rests on an invariant worth stating because it is invisible
+			// from here: `env` is `getShellEnv()`, the host's own environment plus pi's
+			// PI_* session vars, and nothing between the host and this call sets TMPDIR
+			// or the XDG dirs. `tool_call` events carry only `input` (command/timeout),
+			// no env, and `BashSpawnHook` is a per-instance `createBashTool()` option
+			// this tool does not pass. So `cacheEnv` overrides the host, which is the
+			// whole point. If a spawnHook is ever added on this path it must run after
+			// `cacheEnv`, or unset these keys rather than set them, or the redirect
+			// silently wins over whatever the hook chose.
+			const guestEnv = { ...sanitizeEnv(env), ...cacheEnv, ...gitSafeDirectoryEnv(env) };
 			const controller = new AbortController();
 			const onAbort = () => controller.abort();
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -1350,6 +1745,18 @@ export default function (pi: ExtensionAPI) {
 		description: `Guest VM cpu count, 1-${MAX_CPUS}. Overrides gondolin.json`,
 		type: "string",
 	});
+	pi.registerFlag("gondolin-swap", {
+		description: "Guest zram swap size (e.g. 1G). 'off' disables. Default: half the guest's RAM",
+		type: "string",
+	});
+	pi.registerFlag("gondolin-tmpfs-cap", {
+		description: "Cap on guest /tmp and friends (e.g. 256M). 'off' leaves them uncapped. Default: RAM/8",
+		type: "string",
+	});
+	pi.registerFlag("gondolin-no-scratch", {
+		description: "Leave TMPDIR/XDG on the guest image's tmpfs instead of the disk-backed /scratch",
+		type: "boolean",
+	});
 
 	/** A registered string flag, with a blank value treated as unset. */
 	function stringFlag(name: string): string | undefined {
@@ -1366,6 +1773,14 @@ export default function (pi: ExtensionAPI) {
 	let bootedPolicy: WorkspacePolicyState | undefined;
 	/** The sizing the running VM booted with, for the same reason. */
 	let bootedResources: ResourceState | undefined;
+	/** The storage tuning the running VM booted with, for the same reason. */
+	let bootedStorage: StorageState | undefined;
+	/**
+	 * Cache-path overrides for the running VM's commands, empty when the scratch
+	 * redirect is off. Read once at boot so a mid-session config edit cannot put
+	 * live commands onto a scratch tree that was never created.
+	 */
+	let bootedCacheEnv: Record<string, string> = {};
 
 	/**
 	 * Resolve guest memory and CPU count. Per key, first hit wins:
@@ -1409,6 +1824,61 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return { resources, sources, problems };
+	}
+
+	/**
+	 * Resolve the guest storage tuning. Same per-key ladder as the sizing keys:
+	 * flag > project config > user config, first hit wins, a bad value stops the
+	 * ladder for that key.
+	 *
+	 * Sizes are resolved as requested, not as applied. `swap` and `tmpfsCap` may
+	 * come back undefined, meaning "derive", and the derived number needs the
+	 * guest's own RAM — only known after boot. `startVm` does that second step and
+	 * records it in `effective`.
+	 */
+	function resolveStorageSelection(projectCwd: string): StorageState {
+		const layers = configLayers(projectCwd);
+		const storage: StorageConfig = { scratchRedirect: true };
+		const sources: { scratchRedirect?: string; swap?: string; tmpfsCap?: string } = {};
+		const problems: string[] = [];
+
+		const scratch = firstConfigured(configuredCandidates(layers, "scratchRedirect"), (value, source) =>
+			parseBooleanValue("scratchRedirect", value, source, problems),
+		);
+		if (scratch !== undefined) {
+			storage.scratchRedirect = scratch.value;
+			sources.scratchRedirect = scratch.source;
+		}
+		// The flag is negative (`--gondolin-no-scratch`) while the config key is
+		// positive (`scratchRedirect`), so the flag is applied after the key rather
+		// than folded into the same candidate list with an inverted meaning.
+		if (pi.getFlag("gondolin-no-scratch") === true) {
+			storage.scratchRedirect = false;
+			sources.scratchRedirect = "--gondolin-no-scratch";
+		}
+
+		const swap = firstConfigured(
+			[{ source: "--gondolin-swap", value: stringFlag("gondolin-swap") }, ...configuredCandidates(layers, "swap")],
+			(value, source) => parseSizeOrOff("swap", value, source, problems),
+		);
+		if (swap !== undefined) {
+			storage.swap = swap.value;
+			sources.swap = swap.source;
+		}
+
+		const tmpfsCap = firstConfigured(
+			[
+				{ source: "--gondolin-tmpfs-cap", value: stringFlag("gondolin-tmpfs-cap") },
+				...configuredCandidates(layers, "tmpfsCap"),
+			],
+			(value, source) => parseSizeOrOff("tmpfsCap", value, source, problems),
+		);
+		if (tmpfsCap !== undefined) {
+			storage.tmpfsCap = tmpfsCap.value;
+			sources.tmpfsCap = tmpfsCap.source;
+		}
+
+		return { storage, sources, problems };
 	}
 
 	/**
@@ -1602,6 +2072,64 @@ export default function (pi: ExtensionAPI) {
 			}));
 	}
 
+	/**
+	 * Guest RAM to size derived values against when `/proc/meminfo` was unreadable.
+	 *
+	 * Falls back to the configured `memory`, then to gondolin's 1G default, so a
+	 * failed read degrades the derived numbers rather than disabling them.
+	 */
+	function fallbackGuestMemMiB(memory: string | undefined): number {
+		return sizeToMiB(memory ?? GONDOLIN_DEFAULT_MEMORY) ?? 1024;
+	}
+
+	/**
+	 * Apply the storage tuning to a freshly booted VM.
+	 *
+	 * The second half of the resolution: `swap` and `tmpfsCap` may have come back
+	 * undefined meaning "derive", and deriving needs the RAM the guest actually
+	 * booted with. Returns the applied sizes plus anything that failed, so the
+	 * caller reports rather than this throwing.
+	 *
+	 * `effective` is what the guest got, not what was asked for. `scratchRedirect`
+	 * in particular is dropped when the tree could not be created, because
+	 * `bootedCacheEnv` is derived from it: leaving the redirect installed against a
+	 * missing `/scratch` points every temp write in the session at a path that does
+	 * not exist.
+	 *
+	 * `memory` is the resolved `memory` key, passed in rather than read off
+	 * `bootedResources`. This runs during the same startup that assigns that
+	 * variable, so reading it here would make the fallback depend on statement order
+	 * two functions away — move the assignment and the derived sizes silently change.
+	 */
+	async function applyStorageTuning(
+		created: VM,
+		storage: StorageConfig,
+		memory: string | undefined,
+	): Promise<{ effective: { scratchRedirect: boolean; swapMiB?: number; tmpfsCapMiB?: number }; problems: string[] }> {
+		const guestMemMiB = (await readGuestMemMiB(created)) ?? fallbackGuestMemMiB(memory);
+		const swapMiB = resolveSwapMiB(storage, guestMemMiB);
+		const tmpfsCapMiB = resolveTmpfsCapMiB(storage, guestMemMiB);
+		const problems: string[] = [];
+
+		let scratchRedirect = false;
+		if (storage.scratchRedirect) {
+			const problem = await createGuestScratch(created);
+			if (problem === undefined) {
+				scratchRedirect = true;
+			} else {
+				problems.push(`${problem}; scratch redirect disabled, TMPDIR and XDG stay on the guest image's tmpfs`);
+			}
+		}
+		if (tmpfsCapMiB !== undefined) {
+			problems.push(...(await capGuestTmpfs(created, tmpfsCapMiB)));
+		}
+		if (swapMiB !== undefined) {
+			const problem = await enableZramSwap(created, swapMiB);
+			if (problem !== undefined) problems.push(problem);
+		}
+		return { effective: { scratchRedirect, swapMiB, tmpfsCapMiB }, problems };
+	}
+
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
 		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
 		// Retired rather than silently ignored: a pin in a shell profile that stops
@@ -1620,6 +2148,11 @@ export default function (pi: ExtensionAPI) {
 		for (const problem of resourceState.problems) {
 			console.warn(`[gondolin] ${problem}`);
 			ctx?.ui.notify(`Gondolin: ${problem}. That key falls back to gondolin's default.`, "error");
+		}
+		const storageState = resolveStorageSelection(ctx?.cwd ?? localCwd);
+		for (const problem of storageState.problems) {
+			console.warn(`[gondolin] ${problem}`);
+			ctx?.ui.notify(`Gondolin: ${problem}. That key falls back to its derived default.`, "error");
 		}
 		const vmOptions: VMOptions = {
 			sessionLabel: `pi ${path.basename(localCwd)}`,
@@ -1646,6 +2179,19 @@ export default function (pi: ExtensionAPI) {
 		bootedImage = selection;
 		bootedPolicy = policy;
 		bootedResources = resourceState;
+		// Storage tuning runs before anything can write, and is best-effort: a guest
+		// without the zram module, or a mount that refuses to remount, degrades to
+		// the image's own behaviour rather than breaking the boot.
+		const tuning = await applyStorageTuning(created, storageState.storage, resourceState.resources.memory);
+		bootedStorage = { ...storageState, effective: tuning.effective };
+		// Copied rather than assigned by reference: `bootedCacheEnv` is handed to
+		// every bash operation, and a stray write to it would otherwise corrupt the
+		// module-level constant for the rest of the session.
+		bootedCacheEnv = tuning.effective.scratchRedirect ? { ...GUEST_CACHE_ENV } : {};
+		for (const problem of tuning.problems) {
+			console.warn(`[gondolin] ${problem}`);
+			ctx?.ui.notify(`Gondolin: ${problem}`, "warning");
+		}
 		// Before anything that could open a socket: a stale guest clock turns every
 		// freshly minted cert into CERT_NOT_YET_VALID.
 		const clock = await syncGuestClock(created);
@@ -1658,15 +2204,29 @@ export default function (pi: ExtensionAPI) {
 				clock.applied ? "info" : "warning",
 			);
 		}
-		const bashProbe = await created.exec(["/bin/sh", "-lc", "command -v bash || true"]);
-		shellPath = bashProbe.stdout.trim() || "/bin/sh";
+		// Best-effort like the tuning above, and it has to reset `shellPath` rather
+		// than leave it: the value is cached across VMs for the whole session, so a
+		// probe that cannot run must not keep a previous VM's bash path that this
+		// image may not have.
+		const bashProbe = await runGuestScript(created, "command -v bash || true");
+		if (bashProbe.ok) {
+			shellPath = bashProbe.stdout.trim() || "/bin/sh";
+		} else {
+			shellPath = "/bin/sh";
+			const problem = `shell probe failed (${bashProbe.reason}); using /bin/sh`;
+			console.warn(`[gondolin] ${problem}`);
+			ctx?.ui.notify(`Gondolin: ${problem}`, "warning");
+		}
 		vm = created;
 		ctx?.ui.setStatus(
 			"gondolin",
 			ctx.ui.theme.fg("accent", `Gondolin: ${created.id.slice(0, 8)} (${GUEST_WORKSPACE})`),
 		);
 		const imageNote = selection ? `image ${selection.selector}` : gondolinDefaultImageLabel();
-		const readyNote = `Gondolin VM ready (${imageNote}, ${resourceSummary(resourceState.resources)}). ${localCwd} is mounted at ${GUEST_WORKSPACE}.`;
+		const swapNote = tuning.effective.swapMiB === undefined ? "no swap" : `swap ${tuning.effective.swapMiB}M zram`;
+		const readyNote =
+			`Gondolin VM ready (${imageNote}, ${resourceSummary(resourceState.resources)}, ${swapNote}). ` +
+			`${localCwd} is mounted at ${GUEST_WORKSPACE}.`;
 		const policyNotes = [nodeModulesLabel(policy.policy)];
 		if (policy.policy.hideGit) policyNotes.push(gitLabel(policy.policy));
 		ctx?.ui.notify(`${readyNote} ${policyNotes.join(". ")}.`, "info");
@@ -1729,6 +2289,15 @@ export default function (pi: ExtensionAPI) {
 			const active = bootedPolicy ?? configuredPolicy;
 			const configuredResources = resolveResourceSelection(ctx.cwd);
 			const activeResources = bootedResources ?? configuredResources;
+			const configuredStorage = resolveStorageSelection(ctx.cwd);
+			const activeStorage = bootedStorage ?? configuredStorage;
+			// Read the swap and tmpfs state back from the guest rather than reporting
+			// what was asked for: zram may have been unavailable, and a remount may
+			// have been refused, and "what did I actually get" is the only useful
+			// question here.
+			const swapSummary = await readSwapSummary(activeVm);
+			const tmpfsCaps = await readTmpfsCapSummary(activeVm);
+			const scratchActive = activeStorage.effective?.scratchRedirect ?? activeStorage.storage.scratchRedirect;
 			// Every source below is named by scope ("user config", "project config"),
 			// so print the paths once here rather than repeating them on each line.
 			const configPaths = imageConfigPaths(ctx.cwd);
@@ -1757,7 +2326,19 @@ export default function (pi: ExtensionAPI) {
 				`Node modules: ${nodeModulesLabel(active.policy)} (${active.sources.hideNodeModules})`,
 				`Git metadata: ${gitLabel(active.policy)} (${active.sources.hideGit})`,
 				`Hidden paths: ${active.policy.hidePaths.join(", ") || "none"} (${active.sources.hidePaths})`,
-				"Swap: none (gondolin creates no swap device)",
+				`Scratch: ${
+					scratchActive
+						? `${GUEST_SCRATCH} on the disk-backed root (TMPDIR, XDG and UV_CACHE_DIR redirected)`
+						: "off — TMPDIR/XDG remain on the guest image's tmpfs"
+				} (${activeStorage.sources.scratchRedirect ?? "defaults"})`,
+				`Swap: ${swapSummary}${
+					activeStorage.sources.swap ? ` (requested ${activeStorage.sources.swap})` : " (derived from guest RAM)"
+				}`,
+				`Tmpfs caps: ${tmpfsCaps}${
+					activeStorage.sources.tmpfsCap
+						? ` (requested ${activeStorage.sources.tmpfsCap})`
+						: " (derived from guest RAM)"
+				}`,
 			];
 			if (current && current.selector !== bootedImage?.selector) {
 				lines.push(`Image (configured): ${current.selector} from ${current.source} — applies to the next VM`);
@@ -1772,6 +2353,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			for (const problem of configuredResources.problems) {
 				lines.push(`Resource config: ${problem}`);
+			}
+			if (storageSummary(configuredStorage.storage) !== storageSummary(activeStorage.storage)) {
+				lines.push(`Storage (configured): ${storageSummary(configuredStorage.storage)} — applies to the next VM`);
+			}
+			for (const problem of configuredStorage.problems) {
+				lines.push(`Storage config: ${problem}`);
 			}
 			ctx.ui.notify(lines.filter((line): line is string => line !== undefined).join("\n"), "info");
 		},
@@ -1815,7 +2402,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(id, params, signal, onUpdate, ctx) {
 			const activeVm = await ensureVm(ctx);
 			const tool = createBashTool(GUEST_WORKSPACE, {
-				operations: createGondolinBashOps(activeVm, localCwd, shellPath),
+				operations: createGondolinBashOps(activeVm, localCwd, shellPath, bootedCacheEnv),
 			});
 			return tool.execute(id, params, signal, onUpdate);
 		},
@@ -1857,7 +2444,7 @@ export default function (pi: ExtensionAPI) {
 		// Without this, a bash command issued after a long idle still sees
 		// CERT_NOT_YET_VALID on freshly minted proxy certs.
 		await maybeSyncGuestClock(activeVm);
-		return { operations: createGondolinBashOps(activeVm, localCwd, shellPath) };
+		return { operations: createGondolinBashOps(activeVm, localCwd, shellPath, bootedCacheEnv) };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
